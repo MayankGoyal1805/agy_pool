@@ -83,17 +83,27 @@ def format_reset_time(iso_str: Optional[str], tz_name: str = "IST", compact: boo
         secs = int((dt_utc - now_utc).total_seconds())
 
         if secs <= 0:
-            rel = "resets now"
+            rel = "now" if compact else "resets now"
         else:
             days, rem = divmod(secs, 86400)
             hours, rem = divmod(rem, 3600)
             mins, _ = divmod(rem, 60)
-            if days > 0:
-                rel = f"in {days}d {hours}h"
-            elif hours > 0:
-                rel = f"in {hours}h {mins}m"
+            if compact:
+                if days >= 3:
+                    rel = f"{days}d"
+                elif days > 0:
+                    rel = f"{days}d {hours}h"
+                elif hours > 0:
+                    rel = f"{hours}h {mins}m"
+                else:
+                    rel = f"{mins}m"
             else:
-                rel = f"in {mins}m"
+                if days > 0:
+                    rel = f"in {days}d {hours}h"
+                elif hours > 0:
+                    rel = f"in {hours}h {mins}m"
+                else:
+                    rel = f"in {mins}m"
 
         if compact:
             return rel
@@ -121,6 +131,13 @@ def format_bar_str(pct: Optional[int], width: int = 5) -> str:
     return f"[{color}][{bar}] {pct:>3}%[/{color}]"
 
 
+def color_pct_str(pct: Optional[int]) -> str:
+    if pct is None:
+        return "[dim]--[/dim]"
+    color = "green" if pct > 40 else ("yellow" if pct > 15 else "red")
+    return f"[{color}]{pct:>3}%[/{color}]"
+
+
 # =====================================================================
 # Main Commands
 # =====================================================================
@@ -128,6 +145,7 @@ def format_bar_str(pct: Optional[int], width: int = 5) -> str:
 @app.command(name="usage")
 def cmd_usage(
     as_cards: bool = typer.Option(False, "--cards", "-c", help="Show vertical card view"),
+    wide: bool = typer.Option(False, "--wide", "-w", help="Force full 8-column wide table"),
     tz: str = typer.Option(
         os.environ.get("AGY_TIMEZONE", "IST"),
         "--tz",
@@ -215,7 +233,69 @@ def cmd_usage(
         console.rule()
         return
 
-    # Default Full Table View that fits smoothly across pane widths
+    term_width = console.width or 100
+
+    # Responsive Adaptive Table (Under 125 cols: compact 5-column layout <= 75 chars)
+    if not wide and term_width < 125:
+        table = Table(
+            title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            padding=(0, 1),
+        )
+        table.add_column("Slot", justify="center", style="bold cyan")
+        table.add_column("Account", style="bold white", min_width=20, no_wrap=True)
+        table.add_column("Gemini (5h / Wk)", justify="left")
+        table.add_column("Claude / Argon", justify="left")
+        table.add_column("Status", justify="center")
+
+        for item in results:
+            acc = item["acc"]
+            slot = acc["id"]
+            email = acc["email"]
+            pools = item.get("pools", {})
+
+            # Status
+            exp_ts = exhausted_map.get(slot, 0)
+            if exp_ts > now_ts:
+                status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
+            elif not acc.get("authenticated"):
+                status_str = "[bold red]UNAUTH[/bold red]"
+            elif item.get("error"):
+                status_str = "[bold red]ERROR[/bold red]"
+            else:
+                status_str = "[bold green]HEALTHY[/bold green]"
+
+            # Account user + domain
+            if "@" in email:
+                u, d = email.split("@", 1)
+                acc_cell = f"{u}\n[dim]@{d}[/dim]"
+            else:
+                acc_cell = email
+
+            g5_pct = pools.get("Gemini Models", {}).get("5-hr", {}).get("pct")
+            g5_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz, compact=True)
+            gw_pct = pools.get("Gemini Models", {}).get("weekly", {}).get("pct")
+            gw_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz, compact=True)
+
+            g5_str = f"5h: {color_pct_str(g5_pct)}" + (f" [dim]({g5_rst})[/dim]" if g5_rst else "")
+            gw_str = f"Wk: {color_pct_str(gw_pct)}" + (f" [dim]({gw_rst})[/dim]" if gw_rst else "")
+            gem_cell = f"{g5_str}\n{gw_str}"
+
+            cld_pct = pools.get("Claude and GPT models", {}).get("5-hr", {}).get("pct")
+            ar_pct = pools.get("Gemini 4 Argon", {}).get("weekly", {}).get("pct")
+            ar_rst = format_reset_time(pools.get("Gemini 4 Argon", {}).get("weekly", {}).get("reset"), tz, compact=True)
+
+            cld_str = f"Cld: {color_pct_str(cld_pct)}" if cld_pct is not None else "Cld: --"
+            ar_str = f"Arg: {color_pct_str(ar_pct)}" + (f" [dim]({ar_rst})[/dim]" if ar_rst else "") if ar_pct is not None else "[dim]Arg: --[/dim]"
+            other_cell = f"{cld_str}\n{ar_str}"
+
+            table.add_row(slot, acc_cell, gem_cell, other_cell, status_str)
+
+        console.print(table)
+        return
+
+    # Full Widescreen Table View (125+ cols or --wide)
     table = Table(
         title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
         box=box.ROUNDED,

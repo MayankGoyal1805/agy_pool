@@ -100,16 +100,16 @@ def format_reset_time(iso_str: Optional[str], tz_name: str = "IST") -> str:
         tz_label = tz_name.upper()
 
         if secs > 86400:
-            date_str = target_dt.strftime(f"%b %d, %I:%M %p {tz_label}")
+            date_str = target_dt.strftime("%b %d, %I:%M %p")
         else:
-            date_str = target_dt.strftime(f"%I:%M %p {tz_label}")
+            date_str = target_dt.strftime("%I:%M %p")
 
         return f"{date_str} ({rel})"
     except Exception:
         return f"({iso_str[:16]})"
 
 
-def format_bar_str(pct: Optional[int], width: int = 6) -> str:
+def format_bar_str(pct: Optional[int], width: int = 8) -> str:
     if pct is None:
         return "[dim]--[/dim]"
     filled = max(0, min(width, int(round((pct / 100.0) * width))))
@@ -124,8 +124,7 @@ def format_bar_str(pct: Optional[int], width: int = 6) -> str:
 
 @app.command(name="usage")
 def cmd_usage(
-    as_table: bool = typer.Option(False, "--table", "-t", help="Force wide 8-column table view"),
-    as_cards: bool = typer.Option(False, "--cards", "-c", help="Force pane-friendly card grid view"),
+    as_cards: bool = typer.Option(False, "--cards", "-c", help="Show vertical card view"),
     tz: str = typer.Option(
         os.environ.get("AGY_TIMEZONE", "IST"),
         "--tz",
@@ -141,65 +140,8 @@ def cmd_usage(
     exhausted_map = state.get("exhausted", {})
     now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
-    term_width = console.width
-    use_wide_table = (as_table or (term_width >= 125)) and not as_cards
-
-    if use_wide_table:
-        # Full Wide 8-Column Table (Terminal width >= 125)
-        table = Table(
-            title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
-            box=box.ROUNDED,
-            expand=True,
-            header_style="bold cyan",
-        )
-        table.add_column("Slot", justify="center", style="bold cyan", width=5)
-        table.add_column("Email", style="bold white", min_width=18)
-        table.add_column("Gemini 5-Hr", justify="center")
-        table.add_column("Gemini Wk", justify="center")
-        table.add_column("Claude 5-Hr", justify="center")
-        table.add_column("Claude Wk", justify="center")
-        table.add_column("Argon Wk", justify="center")
-        table.add_column("Status", justify="center", width=9)
-
-        for item in results:
-            acc = item["acc"]
-            slot = acc["id"]
-            email = acc["email"]
-            pools = item.get("pools", {})
-
-            # Status
-            exp_ts = exhausted_map.get(slot, 0)
-            if exp_ts > now_ts:
-                status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
-            elif not acc.get("authenticated"):
-                status_str = "[bold red]UNAUTH[/bold red]"
-            elif item.get("error"):
-                status_str = "[bold red]ERROR[/bold red]"
-            else:
-                status_str = "[bold green]HEALTHY[/bold green]"
-
-            gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
-            gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
-            gem_5hr_cell = f"{gem_5hr}\n[dim]{gem_5hr_rst}[/dim]" if gem_5hr_rst else gem_5hr
-
-            gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
-            gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
-            gem_wk_cell = f"{gem_wk}\n[dim]{gem_wk_rst}[/dim]" if gem_wk_rst else gem_wk
-
-            cld_grp = pools.get("Claude and GPT models", {})
-            cld_5hr = format_bar_str(cld_grp.get("5-hr", {}).get("pct"))
-            cld_wk = format_bar_str(cld_grp.get("weekly", {}).get("pct"))
-
-            argon_grp = pools.get("Gemini 4 Argon", {})
-            argon_wk = format_bar_str(argon_grp.get("weekly", {}).get("pct"))
-            argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
-            argon_cell = f"{argon_wk}\n[dim]{argon_wk_rst}[/dim]" if argon_wk_rst else argon_wk
-
-            table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)
-
-        console.print(table)
-    else:
-        # Pane-resilient Structured Grid Cards (< 125 cols, tmux split panes)
+    if as_cards:
+        # Pane-resilient Structured Grid Cards
         console.rule(f"[bold cyan]Antigravity Multi-Account Live Quota Monitor ({tz.upper()})[/bold cyan]")
         for item in results:
             acc = item["acc"]
@@ -268,6 +210,62 @@ def cmd_usage(
             )
             console.print(panel)
         console.rule()
+        return
+
+    # Default Full Table View that fits smoothly across pane widths
+    table = Table(
+        title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
+        box=box.ROUNDED,
+        border_style="cyan",
+        expand=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Slot", justify="center", style="bold cyan", width=5, no_wrap=True)
+    table.add_column("Email", style="bold white", ratio=2)
+    table.add_column("Gemini 5-Hr", justify="center", ratio=2)
+    table.add_column("Gemini Wk", justify="center", ratio=2)
+    table.add_column("Claude 5-Hr", justify="center", no_wrap=True)
+    table.add_column("Claude Wk", justify="center", no_wrap=True)
+    table.add_column("Argon Wk", justify="center", ratio=2)
+    table.add_column("Status", justify="center", no_wrap=True)
+
+    for item in results:
+        acc = item["acc"]
+        slot = acc["id"]
+        email = acc["email"]
+        pools = item.get("pools", {})
+
+        # Status
+        exp_ts = exhausted_map.get(slot, 0)
+        if exp_ts > now_ts:
+            status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
+        elif not acc.get("authenticated"):
+            status_str = "[bold red]UNAUTH[/bold red]"
+        elif item.get("error"):
+            status_str = "[bold red]ERROR[/bold red]"
+        else:
+            status_str = "[bold green]HEALTHY[/bold green]"
+
+        gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
+        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
+        gem_5hr_cell = f"{gem_5hr}\n[dim]{gem_5hr_rst}[/dim]" if gem_5hr_rst else gem_5hr
+
+        gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
+        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
+        gem_wk_cell = f"{gem_wk}\n[dim]{gem_wk_rst}[/dim]" if gem_wk_rst else gem_wk
+
+        cld_grp = pools.get("Claude and GPT models", {})
+        cld_5hr = format_bar_str(cld_grp.get("5-hr", {}).get("pct"))
+        cld_wk = format_bar_str(cld_grp.get("weekly", {}).get("pct"))
+
+        argon_grp = pools.get("Gemini 4 Argon", {})
+        argon_wk = format_bar_str(argon_grp.get("weekly", {}).get("pct"))
+        argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
+        argon_cell = f"{argon_wk}\n[dim]{argon_wk_rst}[/dim]" if argon_wk_rst else argon_wk
+
+        table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)
+
+    console.print(table)
 
 
 @app.command(name="status")
@@ -479,28 +477,37 @@ def cmd_install_plugin():
 
 @instance_app.command(name="list")
 def cmd_instance_list():
-    """List all Antigravity profile instances, their paths, and launcher commands."""
+    """List all Antigravity profile instances, their paths, launcher commands, and remote daemons."""
     instances = list_instances()
     table = Table(
         title="Antigravity Profile Instances on this Machine",
         box=box.ROUNDED,
+        border_style="cyan",
         header_style="bold cyan",
     )
     table.add_column("Instance", style="bold cyan")
     table.add_column("CLI Command", style="bold magenta")
     table.add_column("Active Account", style="bold white")
     table.add_column("Pool Slot", justify="center")
+    table.add_column("Remote View", justify="center")
     table.add_column("Data Mode", justify="center")
     table.add_column("Storage Path (AppData)", style="dim")
 
     for inst in instances:
         slot_str = f"Slot {inst['matching_slot']}" if inst.get("matching_slot") else "[dim]--[/dim]"
         data_mode = "[green]Shared[/green]" if inst.get("shared_data") or inst.get("is_default") else "[cyan]Isolated[/cyan]"
+        
+        # Check systemd remote daemon status
+        svc = "antigravity-cli-daemon.service" if inst["name"] == "primary" else f"antigravity-{inst['name']}-daemon.service"
+        res = subprocess.run(["systemctl", "--user", "is-active", svc], capture_output=True, text=True)
+        rc_status = "[bold green]● Active[/bold green]" if res.stdout.strip() == "active" else "[dim]Inactive[/dim]"
+
         table.add_row(
             inst["name"],
             inst["cli_cmd"],
             inst["email"],
             slot_str,
+            rc_status,
             data_mode,
             inst["path"],
         )
@@ -529,12 +536,34 @@ def cmd_instance_switch(
     instance: str = typer.Argument(..., help="Instance name (e.g. primary, subagents)"),
     slot: str = typer.Argument(..., help="Slot number to assign (e.g. 2)"),
 ):
-    """Switch any instance's active account to a pool slot."""
+    """Switch any instance's active account to a pool slot and reload remote daemon."""
     ok, msg = switch_instance_account(instance, slot)
     if ok:
         console.print(f"[bold green]✓ {msg}[/bold green]")
+        svc = "antigravity-cli-daemon.service" if instance == "primary" else f"antigravity-{instance}-daemon.service"
+        res = subprocess.run(["systemctl", "--user", "is-active", svc], capture_output=True, text=True)
+        if res.stdout.strip() == "active":
+            subprocess.run(["systemctl", "--user", "restart", svc])
+            console.print(f"[bold cyan]✓ Restarted {svc} to apply new account credentials[/bold cyan]")
     else:
         console.print(f"[bold red]✗ {msg}[/bold red]")
+
+
+@instance_app.command(name="remote-control")
+def cmd_instance_remote_control(
+    action: str = typer.Argument("status", help="Action: status, restart, start, stop"),
+    name: str = typer.Option("subagents", "--name", "-n", help="Instance name (e.g. subagents, primary)"),
+):
+    """Manage remote-control background daemons for instances."""
+    service = "antigravity-cli-daemon.service" if name == "primary" else f"antigravity-{name}-daemon.service"
+    if action == "status":
+        res = subprocess.run(["systemctl", "--user", "status", service], capture_output=True, text=True)
+        console.print(res.stdout or res.stderr)
+    elif action in ("restart", "start", "stop"):
+        subprocess.run(["systemctl", "--user", action, service])
+        res = subprocess.run(["systemctl", "--user", "is-active", service], capture_output=True, text=True)
+        st = res.stdout.strip()
+        console.print(f"[bold cyan]{service}: {st}[/bold cyan]")
 
 
 @instance_app.command(name="rm")

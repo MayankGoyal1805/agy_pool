@@ -70,7 +70,7 @@ def get_timezone(tz_name: str = "IST") -> datetime.tzinfo:
         return ZoneInfo("Asia/Kolkata")
 
 
-def format_reset_time(iso_str: Optional[str], tz_name: str = "IST") -> str:
+def format_reset_time(iso_str: Optional[str], tz_name: str = "IST", compact: bool = False) -> str:
     """Format full reset timestamp and relative countdown in requested timezone."""
     if not iso_str:
         return ""
@@ -95,6 +95,9 @@ def format_reset_time(iso_str: Optional[str], tz_name: str = "IST") -> str:
             else:
                 rel = f"in {mins}m"
 
+        if compact:
+            return rel
+
         target_tz = get_timezone(tz_name)
         target_dt = dt_utc.astimezone(target_tz)
         tz_label = tz_name.upper()
@@ -109,7 +112,7 @@ def format_reset_time(iso_str: Optional[str], tz_name: str = "IST") -> str:
         return f"({iso_str[:16]})"
 
 
-def format_bar_str(pct: Optional[int], width: int = 8) -> str:
+def format_bar_str(pct: Optional[int], width: int = 5) -> str:
     if pct is None:
         return "[dim]--[/dim]"
     filled = max(0, min(width, int(round((pct / 100.0) * width))))
@@ -216,18 +219,16 @@ def cmd_usage(
     table = Table(
         title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
         box=box.ROUNDED,
-        border_style="cyan",
-        expand=True,
         header_style="bold cyan",
     )
-    table.add_column("Slot", justify="center", style="bold cyan", width=5, no_wrap=True)
-    table.add_column("Email", style="bold white", ratio=2)
-    table.add_column("Gemini 5-Hr", justify="center", ratio=2)
-    table.add_column("Gemini Wk", justify="center", ratio=2)
-    table.add_column("Claude 5-Hr", justify="center", no_wrap=True)
-    table.add_column("Claude Wk", justify="center", no_wrap=True)
-    table.add_column("Argon Wk", justify="center", ratio=2)
-    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Slot", justify="center", style="bold cyan")
+    table.add_column("Email", style="bold white")
+    table.add_column("Gemini 5-Hr", justify="center")
+    table.add_column("Gemini Wk", justify="center")
+    table.add_column("Claude 5-Hr", justify="center")
+    table.add_column("Claude Wk", justify="center")
+    table.add_column("Argon Wk", justify="center")
+    table.add_column("Status", justify="center")
 
     for item in results:
         acc = item["acc"]
@@ -247,11 +248,11 @@ def cmd_usage(
             status_str = "[bold green]HEALTHY[/bold green]"
 
         gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
-        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
+        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz, compact=True)
         gem_5hr_cell = f"{gem_5hr}\n[dim]{gem_5hr_rst}[/dim]" if gem_5hr_rst else gem_5hr
 
         gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
-        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
+        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz, compact=True)
         gem_wk_cell = f"{gem_wk}\n[dim]{gem_wk_rst}[/dim]" if gem_wk_rst else gem_wk
 
         cld_grp = pools.get("Claude and GPT models", {})
@@ -260,7 +261,7 @@ def cmd_usage(
 
         argon_grp = pools.get("Gemini 4 Argon", {})
         argon_wk = format_bar_str(argon_grp.get("weekly", {}).get("pct"))
-        argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
+        argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz, compact=True)
         argon_cell = f"{argon_wk}\n[dim]{argon_wk_rst}[/dim]" if argon_wk_rst else argon_wk
 
         table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)

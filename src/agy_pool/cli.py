@@ -124,13 +124,14 @@ def format_bar_str(pct: Optional[int], width: int = 6) -> str:
 
 @app.command(name="usage")
 def cmd_usage(
+    as_table: bool = typer.Option(False, "--table", "-t", help="Force wide 8-column table view"),
+    as_cards: bool = typer.Option(False, "--cards", "-c", help="Force pane-friendly card grid view"),
     tz: str = typer.Option(
         os.environ.get("AGY_TIMEZONE", "IST"),
         "--tz",
         "--timezone",
         help="Timezone for reset timestamps (default: IST)",
     ),
-    as_cards: bool = typer.Option(False, "--cards", "-c", help="Force compact card view"),
 ):
     """View real-time Google quota remaining across all accounts & pools in IST."""
     with console.status("[bold cyan]Querying Google quota for all accounts in parallel...[/bold cyan]"):
@@ -140,7 +141,65 @@ def cmd_usage(
     exhausted_map = state.get("exhausted", {})
     now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
-    if as_cards:
+    term_width = console.width
+    use_wide_table = (as_table or (term_width >= 125)) and not as_cards
+
+    if use_wide_table:
+        # Full Wide 8-Column Table (Terminal width >= 125)
+        table = Table(
+            title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
+            box=box.ROUNDED,
+            expand=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Slot", justify="center", style="bold cyan", width=5)
+        table.add_column("Email", style="bold white", min_width=18)
+        table.add_column("Gemini 5-Hr", justify="center")
+        table.add_column("Gemini Wk", justify="center")
+        table.add_column("Claude 5-Hr", justify="center")
+        table.add_column("Claude Wk", justify="center")
+        table.add_column("Argon Wk", justify="center")
+        table.add_column("Status", justify="center", width=9)
+
+        for item in results:
+            acc = item["acc"]
+            slot = acc["id"]
+            email = acc["email"]
+            pools = item.get("pools", {})
+
+            # Status
+            exp_ts = exhausted_map.get(slot, 0)
+            if exp_ts > now_ts:
+                status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
+            elif not acc.get("authenticated"):
+                status_str = "[bold red]UNAUTH[/bold red]"
+            elif item.get("error"):
+                status_str = "[bold red]ERROR[/bold red]"
+            else:
+                status_str = "[bold green]HEALTHY[/bold green]"
+
+            gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
+            gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
+            gem_5hr_cell = f"{gem_5hr}\n[dim]{gem_5hr_rst}[/dim]" if gem_5hr_rst else gem_5hr
+
+            gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
+            gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
+            gem_wk_cell = f"{gem_wk}\n[dim]{gem_wk_rst}[/dim]" if gem_wk_rst else gem_wk
+
+            cld_grp = pools.get("Claude and GPT models", {})
+            cld_5hr = format_bar_str(cld_grp.get("5-hr", {}).get("pct"))
+            cld_wk = format_bar_str(cld_grp.get("weekly", {}).get("pct"))
+
+            argon_grp = pools.get("Gemini 4 Argon", {})
+            argon_wk = format_bar_str(argon_grp.get("weekly", {}).get("pct"))
+            argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
+            argon_cell = f"{argon_wk}\n[dim]{argon_wk_rst}[/dim]" if argon_wk_rst else argon_wk
+
+            table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)
+
+        console.print(table)
+    else:
+        # Pane-resilient Structured Grid Cards (< 125 cols, tmux split panes)
         console.rule(f"[bold cyan]Antigravity Multi-Account Live Quota Monitor ({tz.upper()})[/bold cyan]")
         for item in results:
             acc = item["acc"]
@@ -160,27 +219,48 @@ def cmd_usage(
                 border_color = "red"
             else:
                 status_text = "[bold green]HEALTHY[/bold green]"
-                border_color = "blue"
+                border_color = "cyan"
 
-            t = Table.grid(padding=(0, 2))
-            t.add_column("Group", style="bold yellow", width=26)
-            t.add_column("Limits", style="white")
+            grid = Table.grid(padding=(0, 2), expand=True)
+            grid.add_column("Pool", style="bold yellow", width=18)
+            grid.add_column("Remaining", style="white")
+            grid.add_column("Reset Time (IST)", style="dim white", justify="right")
 
-            if not pools:
-                t.add_row("(No buckets)", "[dim]Not authenticated or no active quota reported[/dim]")
-            else:
-                for grp_name, limits in pools.items():
-                    display_grp = grp_name.replace("Claude and GPT models", "Claude & GPT")
-                    sorted_limits = sorted(limits.items(), key=lambda x: (0 if "5" in x[0] else 1, x[0]))
-                    for kind, p in sorted_limits:
-                        bar = format_bar_str(p["pct"])
-                        rst = format_reset_time(p["reset"], tz)
-                        rst_str = f" · [dim]{rst}[/dim]" if rst else ""
-                        row_label = f"{display_grp} ({kind}):"
-                        t.add_row(row_label, f"{bar}{rst_str}")
+            gem_grp = pools.get("Gemini Models", {})
+            cld_grp = pools.get("Claude and GPT models", {})
+            argon_grp = pools.get("Gemini 4 Argon", {})
+
+            # 1. Gemini 5-Hr
+            g5 = gem_grp.get("5-hr", {})
+            g5_bar = format_bar_str(g5.get("pct"))
+            g5_rst = format_reset_time(g5.get("reset"), tz) or "--"
+            grid.add_row("Gemini 5-Hr", g5_bar, g5_rst)
+
+            # 2. Gemini Weekly
+            gw = gem_grp.get("weekly", {})
+            gw_bar = format_bar_str(gw.get("pct"))
+            gw_rst = format_reset_time(gw.get("reset"), tz) or "--"
+            grid.add_row("Gemini Weekly", gw_bar, gw_rst)
+
+            # 3. Claude 5-Hr
+            c5 = cld_grp.get("5-hr", {})
+            c5_bar = format_bar_str(c5.get("pct"))
+            grid.add_row("Claude 5-Hr", c5_bar, "--")
+
+            # 4. Claude Weekly
+            cw = cld_grp.get("weekly", {})
+            cw_bar = format_bar_str(cw.get("pct"))
+            grid.add_row("Claude Weekly", cw_bar, "--")
+
+            # 5. Argon Weekly (if available)
+            if argon_grp:
+                ar = argon_grp.get("weekly", {})
+                ar_bar = format_bar_str(ar.get("pct"))
+                ar_rst = format_reset_time(ar.get("reset"), tz) or "--"
+                grid.add_row("Gemini 4 Argon", ar_bar, ar_rst)
 
             panel = Panel(
-                t,
+                grid,
                 title=f"[bold cyan]Slot {slot}[/bold cyan] · [bold white]{email}[/bold white]",
                 subtitle=status_text,
                 box=box.ROUNDED,
@@ -188,61 +268,6 @@ def cmd_usage(
             )
             console.print(panel)
         console.rule()
-        return
-
-    # Rounded Table View that adjusts with terminal size
-    table = Table(
-        title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
-        box=box.ROUNDED,
-        expand=True,
-        header_style="bold cyan",
-    )
-    table.add_column("Slot", justify="center", style="bold cyan", width=5)
-    table.add_column("Email", style="bold white")
-    table.add_column("Gemini 5-Hr", justify="center")
-    table.add_column("Gemini Wk", justify="center")
-    table.add_column("Claude 5-Hr", justify="center")
-    table.add_column("Claude Wk", justify="center")
-    table.add_column("Argon Wk", justify="center")
-    table.add_column("Status", justify="center")
-
-    for item in results:
-        acc = item["acc"]
-        slot = acc["id"]
-        email = acc["email"]
-        pools = item.get("pools", {})
-
-        # Status
-        exp_ts = exhausted_map.get(slot, 0)
-        if exp_ts > now_ts:
-            status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
-        elif not acc.get("authenticated"):
-            status_str = "[bold red]UNAUTH[/bold red]"
-        elif item.get("error"):
-            status_str = "[bold red]ERROR[/bold red]"
-        else:
-            status_str = "[bold green]HEALTHY[/bold green]"
-
-        gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
-        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
-        gem_5hr_cell = f"{gem_5hr}\n[dim]{gem_5hr_rst}[/dim]" if gem_5hr_rst else gem_5hr
-
-        gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
-        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
-        gem_wk_cell = f"{gem_wk}\n[dim]{gem_wk_rst}[/dim]" if gem_wk_rst else gem_wk
-
-        cld_grp = pools.get("Claude and GPT models", {})
-        cld_5hr = format_bar_str(cld_grp.get("5-hr", {}).get("pct"))
-        cld_wk = format_bar_str(cld_grp.get("weekly", {}).get("pct"))
-
-        argon_grp = pools.get("Gemini 4 Argon", {})
-        argon_wk = format_bar_str(argon_grp.get("weekly", {}).get("pct"))
-        argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
-        argon_cell = f"{argon_wk}\n[dim]{argon_wk_rst}[/dim]" if argon_wk_rst else argon_wk
-
-        table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)
-
-    console.print(table)
 
 
 @app.command(name="status")

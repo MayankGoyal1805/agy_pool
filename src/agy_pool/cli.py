@@ -70,10 +70,10 @@ def get_timezone(tz_name: str = "IST") -> datetime.tzinfo:
         return ZoneInfo("Asia/Kolkata")
 
 
-def format_reset_time_ist(iso_str: Optional[str], tz_name: str = "IST") -> str:
-    """Format reset timestamp in requested timezone (default: IST) and relative countdown."""
+def format_reset_time(iso_str: Optional[str], tz_name: str = "IST") -> str:
+    """Format full reset timestamp and relative countdown in requested timezone."""
     if not iso_str:
-        return "--"
+        return ""
     try:
         clean = iso_str.replace(" UTC", "+00:00").replace("Z", "+00:00")
         if "T" not in clean and " " in clean:
@@ -83,27 +83,39 @@ def format_reset_time_ist(iso_str: Optional[str], tz_name: str = "IST") -> str:
         secs = int((dt_utc - now_utc).total_seconds())
 
         if secs <= 0:
-            return "ready"
+            rel = "resets now"
+        else:
+            days, rem = divmod(secs, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins, _ = divmod(rem, 60)
+            if days > 0:
+                rel = f"in {days}d {hours}h"
+            elif hours > 0:
+                rel = f"in {hours}h {mins}m"
+            else:
+                rel = f"in {mins}m"
 
         target_tz = get_timezone(tz_name)
-        dt_target = dt_utc.astimezone(target_tz)
-        time_str = dt_target.strftime("%I:%M %p")
+        target_dt = dt_utc.astimezone(target_tz)
+        tz_label = tz_name.upper()
 
-        hours, rem = divmod(secs, 3600)
-        mins, _ = divmod(rem, 60)
-        if hours > 0:
-            return f"{time_str} (in {hours}h {mins}m)"
-        return f"{time_str} (in {mins}m)"
+        if secs > 86400:
+            date_str = target_dt.strftime(f"%b %d, %I:%M %p {tz_label}")
+        else:
+            date_str = target_dt.strftime(f"%I:%M %p {tz_label}")
+
+        return f"{date_str} ({rel})"
     except Exception:
-        return str(iso_str)[:16]
+        return f"({iso_str[:16]})"
 
 
-def format_bar(pct: Optional[int], width: int = 5) -> str:
+def format_bar_str(pct: Optional[int], width: int = 6) -> str:
     if pct is None:
-        return "    --    "
+        return "[dim]--[/dim]"
     filled = max(0, min(width, int(round((pct / 100.0) * width))))
     bar = "█" * filled + "░" * (width - filled)
-    return f"[{bar}]{pct:>3}%"
+    color = "green" if pct > 40 else ("yellow" if pct > 15 else "red")
+    return f"[{color}][{bar}] {pct:>3}%[/{color}]"
 
 
 # =====================================================================
@@ -118,11 +130,11 @@ def cmd_usage(
         "--timezone",
         help="Timezone for reset timestamps (default: IST)",
     ),
-    as_cards: bool = typer.Option(False, "--cards", "-c", help="Show vertical card view"),
+    as_cards: bool = typer.Option(False, "--cards", "-c", help="Force compact card view"),
 ):
     """View real-time Google quota remaining across all accounts & pools in IST."""
-    print("\nQuerying live Google quota for all accounts in parallel...\n")
-    results = fetch_all_usage()
+    with console.status("[bold cyan]Querying Google quota for all accounts in parallel...[/bold cyan]"):
+        results = fetch_all_usage()
 
     state = load_state()
     exhausted_map = state.get("exhausted", {})
@@ -161,8 +173,8 @@ def cmd_usage(
                     display_grp = grp_name.replace("Claude and GPT models", "Claude & GPT")
                     sorted_limits = sorted(limits.items(), key=lambda x: (0 if "5" in x[0] else 1, x[0]))
                     for kind, p in sorted_limits:
-                        bar = format_bar(p["pct"])
-                        rst = format_reset_time_ist(p["reset"], tz)
+                        bar = format_bar_str(p["pct"])
+                        rst = format_reset_time(p["reset"], tz)
                         rst_str = f" · [dim]{rst}[/dim]" if rst else ""
                         row_label = f"{display_grp} ({kind}):"
                         t.add_row(row_label, f"{bar}{rst_str}")
@@ -178,54 +190,59 @@ def cmd_usage(
         console.rule()
         return
 
-    # Default Table View
-    line_width = 118
-    print("=" * line_width)
-    print(f"  Antigravity Multi-Account Live Quota & Usage Monitor ({tz.upper()})")
-    print("=" * line_width)
-    print(f"  {'SLOT':<5} {'EMAIL':<26} {'GEMINI 5HR':<12} {'RESET (IST)':<21} {'GEMINI WK':<12} {'CLAUDE 5HR':<12} {'CLAUDE WK':<12} {'ARGON WK':<10} {'STATUS'}")
-    print("-" * line_width)
+    # Rounded Table View that adjusts with terminal size
+    table = Table(
+        title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
+        box=box.ROUNDED,
+        expand=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Slot", justify="center", style="bold cyan", width=5)
+    table.add_column("Email", style="bold white")
+    table.add_column("Gemini 5-Hr", justify="center")
+    table.add_column("Gemini Wk", justify="center")
+    table.add_column("Claude 5-Hr", justify="center")
+    table.add_column("Claude Wk", justify="center")
+    table.add_column("Argon Wk", justify="center")
+    table.add_column("Status", justify="center")
 
     for item in results:
         acc = item["acc"]
         slot = acc["id"]
         email = acc["email"]
         pools = item.get("pools", {})
-        if len(email) > 24:
-            email = email[:21] + "..."
 
-        if not acc.get("authenticated"):
-            print(f"  {slot:<5} {'(not authenticated)':<26} {'--':<12} {'--':<21} {'--':<12} {'--':<12} {'--':<12} {'--':<10} UNAUTHENTICATED")
-            continue
-
-        if item.get("error"):
-            print(f"  {slot:<5} {email:<26} ERROR: {item['error']}")
-            continue
-
-        gem_5hr = format_bar(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
-        gem_5hr_rst = format_reset_time_ist(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
-        gem_wk = format_bar(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
-        cld_5hr = format_bar(pools.get("Claude and GPT models", {}).get("5-hr", {}).get("pct"))
-        cld_wk = format_bar(pools.get("Claude and GPT models", {}).get("weekly", {}).get("pct"))
-        argon_pct = pools.get("Gemini 4 Argon", {}).get("weekly", {}).get("pct")
-        argon_wk = format_bar(argon_pct) if argon_pct is not None else "    --    "
-
+        # Status
         exp_ts = exhausted_map.get(slot, 0)
         if exp_ts > now_ts:
-            mins_left = int((exp_ts - now_ts) / 60)
-            status_str = f"COOLDOWN ({mins_left}m)"
+            status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
         elif not acc.get("authenticated"):
-            status_str = "UNAUTH"
+            status_str = "[bold red]UNAUTH[/bold red]"
         elif item.get("error"):
-            status_str = "ERROR"
+            status_str = "[bold red]ERROR[/bold red]"
         else:
-            status_str = "HEALTHY"
+            status_str = "[bold green]HEALTHY[/bold green]"
 
-        print(f"  {slot:<5} {email:<26} {gem_5hr:<12} {gem_5hr_rst:<21} {gem_wk:<12} {cld_5hr:<12} {cld_wk:<12} {argon_wk:<10} {status_str}")
+        gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
+        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
+        gem_5hr_cell = f"{gem_5hr}\n[dim]{gem_5hr_rst}[/dim]" if gem_5hr_rst else gem_5hr
 
-    print("=" * line_width)
-    print("  Note: '--' indicates the model group is not available for that account slot.")
-    print("=" * line_width + "\n")
+        gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
+        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
+        gem_wk_cell = f"{gem_wk}\n[dim]{gem_wk_rst}[/dim]" if gem_wk_rst else gem_wk
+
+        cld_grp = pools.get("Claude and GPT models", {})
+        cld_5hr = format_bar_str(cld_grp.get("5-hr", {}).get("pct"))
+        cld_wk = format_bar_str(cld_grp.get("weekly", {}).get("pct"))
+
+        argon_grp = pools.get("Gemini 4 Argon", {})
+        argon_wk = format_bar_str(argon_grp.get("weekly", {}).get("pct"))
+        argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
+        argon_cell = f"{argon_wk}\n[dim]{argon_wk_rst}[/dim]" if argon_wk_rst else argon_wk
+
+        table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)
+
+    console.print(table)
 
 
 @app.command(name="status")

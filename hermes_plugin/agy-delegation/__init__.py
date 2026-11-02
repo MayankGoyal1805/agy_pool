@@ -160,9 +160,14 @@ class AntigravityChildAgent:
 
     def get_activity_summary(self) -> dict[str, Any]:
         acc_label = self.allocated_account.get("id") if self.allocated_account else "default"
+        is_running = self._active_proc is not None and self._active_proc.poll() is None
+        now = time.time()
         return {
             "last_activity_desc": f"executing Antigravity CLI ({self.model}) on {acc_label}",
-            "running": self._active_proc is not None and self._active_proc.poll() is None,
+            "running": is_running,
+            "current_tool": "antigravity-cli" if is_running else None,
+            "last_activity_ts": now if is_running else getattr(self, "_last_done_ts", now),
+            "api_call_count": getattr(self, "session_completion_tokens", 1) or 1,
         }
 
     def _allocate_resources(self):
@@ -230,6 +235,7 @@ class AntigravityChildAgent:
                 "--model", self.model,
                 "--output-format", "json",
                 "--dangerously-skip-permissions",
+                "--print-timeout", "20m",
             ]
 
             if self.allocated_account and "rel_dir" in self.allocated_account:
@@ -253,6 +259,8 @@ class AntigravityChildAgent:
                 )
 
             start_time = time.monotonic()
+            child_env = os.environ.copy()
+            child_env["HERMES_SUBAGENT"] = "1"
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -262,11 +270,13 @@ class AntigravityChildAgent:
                 encoding="utf-8",
                 errors="replace",
                 cwd=self.cwd,
+                env=child_env,
             )
             self._active_proc = proc
 
             stdout, stderr = proc.communicate(input=prompt_text)
             duration = round(time.monotonic() - start_time, 2)
+            self._last_done_ts = time.time()
             self._active_proc = None
 
             # Handle errors & quota exhaustion
@@ -352,6 +362,13 @@ class AntigravityChildAgent:
                     except Exception:
                         pass
 
+                brain_path = ""
+                if self.agy_conversation_id:
+                    if self.allocated_account and "rel_dir" in self.allocated_account:
+                        brain_path = f"/home/ubuntu/.gemini/{self.allocated_account['rel_dir']}/brain/{self.agy_conversation_id}"
+                    else:
+                        brain_path = f"/home/ubuntu/.gemini/antigravity-cli/brain/{self.agy_conversation_id}"
+
                 return {
                     "final_response": resp_text,
                     "completed": status_ok,
@@ -361,6 +378,7 @@ class AntigravityChildAgent:
                         {"role": "assistant", "content": resp_text},
                     ],
                     "conversation_id": self.agy_conversation_id,
+                    "brain_path": brain_path,
                 }
             except json.JSONDecodeError as exc:
                 logger.error("[AntigravitySubagent-%d] Failed to parse agy JSON: %s\nOutput: %s", self.task_index, exc, stdout)

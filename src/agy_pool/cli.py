@@ -26,6 +26,7 @@ from .manager import (
     ensure_dirs,
     get_instance_dir,
     get_instance_rel_dir,
+    get_instance_remote_status,
     get_next_available_slot,
     import_primary_cli_account,
     list_accounts,
@@ -34,6 +35,8 @@ from .manager import (
     remove_instance,
     resolve_slot_id,
     save_state,
+    start_instance_remote,
+    stop_instance_remote,
     switch_instance_account,
 )
 from .quota import fetch_all_usage
@@ -495,7 +498,7 @@ def cmd_instance_list():
     instances = list_instances()
     table = Table(
         title="Antigravity Profile Instances on this Machine",
-        box=box.ROUNDED,
+        box=box.SQUARE,
         border_style="cyan",
         header_style="bold cyan",
     )
@@ -503,18 +506,19 @@ def cmd_instance_list():
     table.add_column("CLI Command", style="bold magenta")
     table.add_column("Active Account", style="bold white")
     table.add_column("Pool Slot", justify="center")
-    table.add_column("Remote View", justify="center")
+    table.add_column("Remote Control Device", justify="center")
     table.add_column("Data Mode", justify="center")
     table.add_column("Storage Path (AppData)", style="dim")
 
     for inst in instances:
         slot_str = f"Slot {inst['matching_slot']}" if inst.get("matching_slot") else "[dim]--[/dim]"
-        data_mode = "[green]Shared[/green]" if inst.get("shared_data") or inst.get("is_default") else "[cyan]Isolated[/cyan]"
-        
-        # Check systemd remote daemon status
-        svc = "antigravity-cli-daemon.service" if inst["name"] == "primary" else f"antigravity-{inst['name']}-daemon.service"
-        res = subprocess.run(["systemctl", "--user", "is-active", svc], capture_output=True, text=True)
-        rc_status = "[bold green]● Active[/bold green]" if res.stdout.strip() == "active" else "[dim]Inactive[/dim]"
+        data_mode = "[cyan]Primary[/cyan]" if inst.get("is_default") else ("[green]Shared[/green]" if inst.get("shared_data") else "[cyan]Isolated[/cyan]")
+
+        remote_info = get_instance_remote_status(inst["name"])
+        if remote_info["active"]:
+            rc_status = f"[bold green]● Active[/bold green] [dim]({remote_info['hostname']})[/dim]"
+        else:
+            rc_status = "[dim]Inactive[/dim]"
 
         table.add_row(
             inst["name"],
@@ -532,15 +536,24 @@ def cmd_instance_list():
 @instance_app.command(name="create")
 def cmd_instance_create(
     name: str = typer.Argument(..., help="New instance name (e.g. subagents, coding)"),
-    slot: Optional[str] = typer.Option(None, "--slot", "-s", help="Slot number to assign"),
+    slot: Optional[str] = typer.Option(None, "--slot", "-s", help="Slot number to assign (e.g. 2)"),
     path: Optional[Path] = typer.Option(None, "--path", "-p", help="Custom directory path (optional)"),
-    shared_data: bool = typer.Option(True, "--shared/--isolated", help="Share conversation data with primary instance"),
+    shared_tools: bool = typer.Option(True, "--tools/--isolated-tools", help="Share MCP config and custom skills"),
+    remote: bool = typer.Option(False, "--remote", "-r", help="Automatically launch background Google Remote Control daemon"),
+    remote_name: Optional[str] = typer.Option(None, "--remote-name", help="Custom label shown on https://antigravity.google.com"),
 ):
     """Create a new Antigravity instance profile with dedicated launcher."""
-    ok, msg = create_instance(name, slot_id=slot, custom_path=path, shared_data=shared_data)
+    ok, msg = create_instance(name, slot_id=slot, custom_path=path, shared_data=shared_tools)
     if ok:
         console.print(f"[bold green]✓ {msg}[/bold green]")
-        console.print(f"[dim]Run with `agy-{name}` or `agy-pool run {name}`.[/dim]\n")
+        console.print(f"[dim]Run directly with `agy-{name}` or `agy-pool run {name}`.[/dim]\n")
+
+        if remote:
+            rok, rmsg = start_instance_remote(name, hostname=remote_name)
+            if rok:
+                console.print(f"[bold green]✓ {rmsg}[/bold green]\n")
+            else:
+                console.print(f"[bold red]✗ {rmsg}[/bold red]\n")
     else:
         console.print(f"[bold red]✗ {msg}[/bold red]\n")
 
@@ -554,30 +567,40 @@ def cmd_instance_switch(
     ok, msg = switch_instance_account(instance, slot)
     if ok:
         console.print(f"[bold green]✓ {msg}[/bold green]")
-        svc = "antigravity-cli-daemon.service" if instance == "primary" else f"antigravity-{instance}-daemon.service"
-        res = subprocess.run(["systemctl", "--user", "is-active", svc], capture_output=True, text=True)
-        if res.stdout.strip() == "active":
-            subprocess.run(["systemctl", "--user", "restart", svc])
-            console.print(f"[bold cyan]✓ Restarted {svc} to apply new account credentials[/bold cyan]")
     else:
         console.print(f"[bold red]✗ {msg}[/bold red]")
 
 
-@instance_app.command(name="remote-control")
-def cmd_instance_remote_control(
-    action: str = typer.Argument("status", help="Action: status, restart, start, stop"),
-    name: str = typer.Option("subagents", "--name", "-n", help="Instance name (e.g. subagents, primary)"),
+@instance_app.command(name="remote")
+def cmd_instance_remote(
+    instance: str = typer.Argument(..., help="Instance name (e.g. primary, subagents, coding)"),
+    action: str = typer.Argument("status", help="Action: status, start, stop, restart"),
+    name: Optional[str] = typer.Option(None, "--name", "-n", help="Machine label to show on https://antigravity.google.com"),
 ):
-    """Manage remote-control background daemons for instances."""
-    service = "antigravity-cli-daemon.service" if name == "primary" else f"antigravity-{name}-daemon.service"
+    """Manage background Google Remote Control daemons and machine names for instances."""
+    action = action.lower()
     if action == "status":
-        res = subprocess.run(["systemctl", "--user", "status", service], capture_output=True, text=True)
-        console.print(res.stdout or res.stderr)
-    elif action in ("restart", "start", "stop"):
-        subprocess.run(["systemctl", "--user", action, service])
-        res = subprocess.run(["systemctl", "--user", "is-active", service], capture_output=True, text=True)
-        st = res.stdout.strip()
-        console.print(f"[bold cyan]{service}: {st}[/bold cyan]")
+        info = get_instance_remote_status(instance)
+        color = "green" if info["active"] else "yellow"
+        state_label = "ACTIVE" if info["active"] else "INACTIVE"
+        console.print(f"\n[bold cyan]Instance '{instance}' Remote Control Status:[/bold cyan]")
+        console.print(f"  Service:  [bold white]{info['service']}[/bold white]")
+        console.print(f"  Status:   [{color}]{state_label}[/{color}]")
+        console.print(f"  Device:   [bold yellow]{info['hostname']}[/bold yellow] (registered on https://antigravity.google.com)\n")
+    elif action in ("start", "restart"):
+        ok, msg = start_instance_remote(instance, hostname=name)
+        if ok:
+            console.print(f"[bold green]✓ {msg}[/bold green]\n")
+        else:
+            console.print(f"[bold red]✗ {msg}[/bold red]\n")
+    elif action == "stop":
+        ok, msg = stop_instance_remote(instance)
+        if ok:
+            console.print(f"[bold green]✓ {msg}[/bold green]\n")
+        else:
+            console.print(f"[bold red]✗ {msg}[/bold red]\n")
+    else:
+        console.print(f"[bold red]Unknown action '{action}'. Use status, start, stop, or restart.[/bold red]")
 
 
 @instance_app.command(name="rm")

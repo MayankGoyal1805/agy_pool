@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import threading
 import uuid
 from pathlib import Path
@@ -263,7 +264,7 @@ def list_instances() -> list[dict[str, Any]]:
     # 2. Custom instances under ~/.gemini/instances
     if INSTANCES_DIR.exists():
         for p in sorted(INSTANCES_DIR.iterdir()):
-            if p.is_dir():
+            if p.is_dir() and not p.name.startswith(".") and not p.name.endswith("_env"):
                 tok = p / "antigravity-oauth-token"
                 em = get_token_email(tok)
                 # Check if it shares data via symlinked brain
@@ -305,9 +306,164 @@ def switch_instance_account(instance_name: str, slot_id: str) -> tuple[bool, str
     try:
         shutil.copy2(slot_token, target_token)
         new_email = get_token_email(target_token)
+
+        # If a remote daemon is running for this instance, restart it to re-authenticate
+        svc = "antigravity-cli-daemon.service" if instance_name == "primary" else f"antigravity-{instance_name}-daemon.service"
+        res = subprocess.run(["systemctl", "--user", "is-active", svc], capture_output=True, text=True)
+        if res.stdout.strip() == "active":
+            subprocess.run(["systemctl", "--user", "restart", svc], check=False)
+            return True, f"Instance '{instance_name}' switched to Slot {slot_id} ({new_email}) [Restarted remote daemon]"
+
         return True, f"Instance '{instance_name}' switched to Slot {slot_id} ({new_email})"
     except Exception as exc:
         return False, f"Failed to switch token: {exc}"
+
+
+INSTANCE_ENVS_DIR = INSTANCES_DIR / ".envs"
+
+
+def get_instance_remote_status(instance_name: str) -> dict[str, Any]:
+    """Check systemd service and configured hostname for an instance."""
+    name = instance_name.strip().lower()
+    is_primary = name in ("primary", "default", "cli")
+    svc = "antigravity-cli-daemon.service" if is_primary else f"antigravity-{name}-daemon.service"
+
+    res = subprocess.run(["systemctl", "--user", "is-active", svc], capture_output=True, text=True)
+    is_active = res.stdout.strip() == "active"
+
+    cfg_file = (
+        (PRIMARY_CLI_DIR.parent / "config" / "config.json")
+        if is_primary
+        else (INSTANCE_ENVS_DIR / name / ".gemini" / "config" / "config.json")
+    )
+    hostname = "Primary-CLI" if is_primary else f"{name.capitalize()}-Pool"
+    if cfg_file.exists():
+        try:
+            with open(cfg_file) as f:
+                cfg = json.load(f)
+                hostname = cfg.get("userSettings", {}).get("cliRemoteControlHostname", hostname)
+        except Exception:
+            pass
+
+    return {
+        "service": svc,
+        "active": is_active,
+        "hostname": hostname,
+    }
+
+
+def start_instance_remote(instance_name: str, hostname: Optional[str] = None) -> tuple[bool, str]:
+    """Provision remote control daemon and start systemd service for an instance."""
+    name = instance_name.strip().lower()
+    is_primary = name in ("primary", "default", "cli")
+    resolved_name = "primary" if is_primary else name
+    inst_dir = get_instance_dir(resolved_name)
+    if not inst_dir.exists():
+        return False, f"Instance '{resolved_name}' does not exist at {inst_dir}"
+
+    remote_label = hostname or ("Primary-CLI" if is_primary else f"{resolved_name.capitalize()}-Pool")
+
+    systemd_user_dir = Path.home() / ".config" / "systemd" / "user"
+    systemd_user_dir.mkdir(parents=True, exist_ok=True)
+
+    if is_primary:
+        svc_name = "antigravity-cli-daemon.service"
+        cfg_file = PRIMARY_CLI_DIR.parent / "config" / "config.json"
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg = {}
+        if cfg_file.exists():
+            try:
+                with open(cfg_file) as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+        cfg.setdefault("userSettings", {})["cliRemoteControlHostname"] = remote_label
+        with open(cfg_file, "w") as f:
+            json.dump(cfg, f, indent=2)
+
+        service_content = f"""[Unit]
+Description=antigravity remote-control daemon
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart={AGY_BIN} remote-control serve
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=3
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+    else:
+        svc_name = f"antigravity-{resolved_name}-daemon.service"
+        env_home = INSTANCE_ENVS_DIR / resolved_name
+        env_gemini = env_home / ".gemini"
+        env_config = env_gemini / "config"
+        env_config.mkdir(parents=True, exist_ok=True)
+
+        base_cfg = {}
+        base_cfg_file = PRIMARY_CLI_DIR.parent / "config" / "config.json"
+        if base_cfg_file.exists():
+            try:
+                with open(base_cfg_file) as f:
+                    base_cfg = json.load(f)
+            except Exception:
+                pass
+        base_cfg.setdefault("userSettings", {})["cliRemoteControlHostname"] = remote_label
+        base_cfg["userSettings"]["remoteControlHostname"] = f"instance-remote-{resolved_name}"
+        with open(env_config / "config.json", "w") as f:
+            json.dump(base_cfg, f, indent=2)
+
+        app_data_link = env_gemini / "antigravity-cli"
+        if app_data_link.is_symlink() or app_data_link.exists():
+            app_data_link.unlink()
+        app_data_link.symlink_to(inst_dir)
+
+        service_content = f"""[Unit]
+Description=antigravity {resolved_name} remote-control daemon
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment="HOME={env_home}"
+ExecStart={AGY_BIN} remote-control serve
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=3
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+
+    unit_file = systemd_user_dir / svc_name
+    unit_file.write_text(service_content)
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", svc_name], check=False)
+    res = subprocess.run(["systemctl", "--user", "restart", svc_name], capture_output=True, text=True)
+    if res.returncode == 0:
+        return True, f"Started remote daemon '{svc_name}' as \"{remote_label}\". Viewable at https://antigravity.google.com"
+    return False, f"Failed to start service {svc_name}: {res.stderr or res.stdout}"
+
+
+def stop_instance_remote(instance_name: str) -> tuple[bool, str]:
+    """Stop and disable remote control daemon for an instance."""
+    name = instance_name.strip().lower()
+    is_primary = name in ("primary", "default", "cli")
+    svc_name = "antigravity-cli-daemon.service" if is_primary else f"antigravity-{name}-daemon.service"
+
+    subprocess.run(["systemctl", "--user", "stop", svc_name], check=False)
+    subprocess.run(["systemctl", "--user", "disable", svc_name], check=False)
+    return True, f"Stopped remote daemon '{svc_name}'"
 
 
 def create_instance(

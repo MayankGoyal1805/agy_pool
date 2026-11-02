@@ -39,7 +39,10 @@ from .manager import (
 from .quota import fetch_all_usage
 from .tmux import TMUX_SESSION_NAME
 
-console = Console()
+console = Console(
+    width=int(os.environ["COLUMNS"]) if "COLUMNS" in os.environ else None,
+    height=int(os.environ.get("LINES", 50)) if "COLUMNS" in os.environ else None,
+)
 app = typer.Typer(
     name="agy-pool",
     help="Antigravity Multi-Account Pool & Instance Manager",
@@ -70,7 +73,7 @@ def get_timezone(tz_name: str = "IST") -> datetime.tzinfo:
         return ZoneInfo("Asia/Kolkata")
 
 
-def format_reset_time(iso_str: Optional[str], tz_name: str = "IST", compact: bool = False) -> str:
+def format_reset_time(iso_str: Optional[str], tz_name: str = "IST") -> str:
     """Format full reset timestamp and relative countdown in requested timezone."""
     if not iso_str:
         return ""
@@ -83,46 +86,33 @@ def format_reset_time(iso_str: Optional[str], tz_name: str = "IST", compact: boo
         secs = int((dt_utc - now_utc).total_seconds())
 
         if secs <= 0:
-            rel = "now" if compact else "resets now"
+            rel = "resets now"
         else:
             days, rem = divmod(secs, 86400)
             hours, rem = divmod(rem, 3600)
             mins, _ = divmod(rem, 60)
-            if compact:
-                if days >= 3:
-                    rel = f"{days}d"
-                elif days > 0:
-                    rel = f"{days}d {hours}h"
-                elif hours > 0:
-                    rel = f"{hours}h {mins}m"
-                else:
-                    rel = f"{mins}m"
+            if days > 0:
+                rel = f"in {days}d {hours}h"
+            elif hours > 0:
+                rel = f"in {hours}h {mins}m"
             else:
-                if days > 0:
-                    rel = f"in {days}d {hours}h"
-                elif hours > 0:
-                    rel = f"in {hours}h {mins}m"
-                else:
-                    rel = f"in {mins}m"
-
-        if compact:
-            return rel
+                rel = f"in {mins}m"
 
         target_tz = get_timezone(tz_name)
         target_dt = dt_utc.astimezone(target_tz)
         tz_label = tz_name.upper()
 
         if secs > 86400:
-            date_str = target_dt.strftime("%b %d, %I:%M %p")
+            date_str = target_dt.strftime(f"%b %d, %H:%M {tz_label}")
         else:
-            date_str = target_dt.strftime("%I:%M %p")
+            date_str = target_dt.strftime(f"%H:%M {tz_label}")
 
         return f"{date_str} ({rel})"
     except Exception:
         return f"({iso_str[:16]})"
 
 
-def format_bar_str(pct: Optional[int], width: int = 5) -> str:
+def format_bar_str(pct: Optional[int], width: int = 4) -> str:
     if pct is None:
         return "[dim]--[/dim]"
     filled = max(0, min(width, int(round((pct / 100.0) * width))))
@@ -233,82 +223,21 @@ def cmd_usage(
         console.rule()
         return
 
-    term_width = console.width or 100
-
-    # Responsive Adaptive Table (Under 125 cols: compact 5-column layout <= 75 chars)
-    if not wide and term_width < 125:
-        table = Table(
-            title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
-            box=box.ROUNDED,
-            header_style="bold cyan",
-            padding=(0, 1),
-        )
-        table.add_column("Slot", justify="center", style="bold cyan")
-        table.add_column("Account", style="bold white", min_width=20, no_wrap=True)
-        table.add_column("Gemini (5h / Wk)", justify="left")
-        table.add_column("Claude / Argon", justify="left")
-        table.add_column("Status", justify="center")
-
-        for item in results:
-            acc = item["acc"]
-            slot = acc["id"]
-            email = acc["email"]
-            pools = item.get("pools", {})
-
-            # Status
-            exp_ts = exhausted_map.get(slot, 0)
-            if exp_ts > now_ts:
-                status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
-            elif not acc.get("authenticated"):
-                status_str = "[bold red]UNAUTH[/bold red]"
-            elif item.get("error"):
-                status_str = "[bold red]ERROR[/bold red]"
-            else:
-                status_str = "[bold green]HEALTHY[/bold green]"
-
-            # Account user + domain
-            if "@" in email:
-                u, d = email.split("@", 1)
-                acc_cell = f"{u}\n[dim]@{d}[/dim]"
-            else:
-                acc_cell = email
-
-            g5_pct = pools.get("Gemini Models", {}).get("5-hr", {}).get("pct")
-            g5_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz, compact=True)
-            gw_pct = pools.get("Gemini Models", {}).get("weekly", {}).get("pct")
-            gw_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz, compact=True)
-
-            g5_str = f"5h: {color_pct_str(g5_pct)}" + (f" [dim]({g5_rst})[/dim]" if g5_rst else "")
-            gw_str = f"Wk: {color_pct_str(gw_pct)}" + (f" [dim]({gw_rst})[/dim]" if gw_rst else "")
-            gem_cell = f"{g5_str}\n{gw_str}"
-
-            cld_pct = pools.get("Claude and GPT models", {}).get("5-hr", {}).get("pct")
-            ar_pct = pools.get("Gemini 4 Argon", {}).get("weekly", {}).get("pct")
-            ar_rst = format_reset_time(pools.get("Gemini 4 Argon", {}).get("weekly", {}).get("reset"), tz, compact=True)
-
-            cld_str = f"Cld: {color_pct_str(cld_pct)}" if cld_pct is not None else "Cld: --"
-            ar_str = f"Arg: {color_pct_str(ar_pct)}" + (f" [dim]({ar_rst})[/dim]" if ar_rst else "") if ar_pct is not None else "[dim]Arg: --[/dim]"
-            other_cell = f"{cld_str}\n{ar_str}"
-
-            table.add_row(slot, acc_cell, gem_cell, other_cell, status_str)
-
-        console.print(table)
-        return
-
-    # Full Widescreen Table View (125+ cols or --wide)
+    # Full 8-Column Table View
     table = Table(
-        title=f"Antigravity Multi-Account Live Quota Monitor ({tz.upper()})",
-        box=box.ROUNDED,
+        title="Antigravity Multi-Account Live Quota Monitor",
+        box=box.SQUARE,
+        border_style="cyan",
         header_style="bold cyan",
     )
     table.add_column("Slot", justify="center", style="bold cyan")
-    table.add_column("Email", style="bold white")
-    table.add_column("Gemini 5-Hr", justify="center")
-    table.add_column("Gemini Wk", justify="center")
-    table.add_column("Claude 5-Hr", justify="center")
-    table.add_column("Claude Wk", justify="center")
-    table.add_column("Argon Wk", justify="center")
-    table.add_column("Status", justify="center")
+    table.add_column("Email", style="bold white", no_wrap=True)
+    table.add_column("Gemini 5-Hr", justify="center", no_wrap=True)
+    table.add_column("Gemini Wk", justify="center", no_wrap=True)
+    table.add_column("Claude 5-Hr", justify="center", no_wrap=True)
+    table.add_column("Claude Wk", justify="center", no_wrap=True)
+    table.add_column("Argon Wk", justify="center", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
 
     for item in results:
         acc = item["acc"]
@@ -328,21 +257,25 @@ def cmd_usage(
             status_str = "[bold green]HEALTHY[/bold green]"
 
         gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
-        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz, compact=True)
-        gem_5hr_cell = f"{gem_5hr}\n[dim]{gem_5hr_rst}[/dim]" if gem_5hr_rst else gem_5hr
+        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
+        gem_5hr_cell = f"{gem_5hr}\n{gem_5hr_rst}" if gem_5hr_rst else gem_5hr
 
         gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
-        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz, compact=True)
-        gem_wk_cell = f"{gem_wk}\n[dim]{gem_wk_rst}[/dim]" if gem_wk_rst else gem_wk
+        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
+        gem_wk_cell = f"{gem_wk}\n{gem_wk_rst}" if gem_wk_rst else gem_wk
 
         cld_grp = pools.get("Claude and GPT models", {})
         cld_5hr = format_bar_str(cld_grp.get("5-hr", {}).get("pct"))
         cld_wk = format_bar_str(cld_grp.get("weekly", {}).get("pct"))
 
         argon_grp = pools.get("Gemini 4 Argon", {})
-        argon_wk = format_bar_str(argon_grp.get("weekly", {}).get("pct"))
-        argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz, compact=True)
-        argon_cell = f"{argon_wk}\n[dim]{argon_wk_rst}[/dim]" if argon_wk_rst else argon_wk
+        argon_pct = argon_grp.get("weekly", {}).get("pct")
+        if argon_pct is not None:
+            argon_wk = format_bar_str(argon_pct)
+            argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
+            argon_cell = f"{argon_wk}\n{argon_wk_rst}" if argon_wk_rst else argon_wk
+        else:
+            argon_cell = "[dim]--[/dim]"
 
         table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)
 

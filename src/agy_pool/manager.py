@@ -26,18 +26,10 @@ INSTANCES_DIR = Path(os.environ.get("AGY_INSTANCES_DIR", GEMINI_ROOT / "instance
 LOCAL_BIN_DIR = Path.home() / ".local" / "bin"
 
 SHARED_DATA_TARGETS = [
-    "brain",
-    "conversations",
-    "conversation_summaries.db",
-    "conversation_summaries.db-shm",
-    "conversation_summaries.db-wal",
-    "jetbox_summaries_proto.pb",
-    "agyhub_summaries_proto.pb",
     "mcp",
     "mcp_config.json",
     "scratch",
     "builtin",
-    "annotations",
 ]
 
 _pool_lock = threading.Lock()

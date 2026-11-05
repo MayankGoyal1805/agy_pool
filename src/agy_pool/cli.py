@@ -460,27 +460,48 @@ def cmd_view():
 
 @app.command(name="install-hermes-plugin")
 def cmd_install_plugin():
-    """Install or update the Hermes agy-delegation plugin."""
+    """Install or update the Hermes agy-delegation plugin from GitHub."""
+    repo_url = "https://github.com/MayankGoyal1805/antigravity_delegate_hermes.git"
+    identifier = "MayankGoyal1805/antigravity_delegate_hermes"
+    hermes_bin = shutil.which("hermes") or (Path.home() / ".local" / "bin" / "hermes")
     hermes_plugins_dir = Path.home() / ".hermes" / "plugins"
     target_plugin_dir = hermes_plugins_dir / "agy-delegation"
 
-    repo_plugin_src = Path(__file__).resolve().parent.parent.parent / "hermes_plugin" / "agy-delegation"
-    if not repo_plugin_src.exists():
-        repo_plugin_src = Path("/home/ubuntu/repos/agy_pool/hermes_plugin/agy-delegation")
-
-    if not repo_plugin_src.exists():
-        console.print(f"[bold red]Error: Plugin source not found at {repo_plugin_src}[/bold red]")
-        return
-
-    hermes_plugins_dir.mkdir(parents=True, exist_ok=True)
-    if target_plugin_dir.exists():
-        if target_plugin_dir.is_symlink():
-            target_plugin_dir.unlink()
+    installed = False
+    if hermes_bin and Path(hermes_bin).exists():
+        console.print(f"[dim]Installing plugin via Hermes CLI (`hermes plugins install {identifier}`)...[/dim]")
+        res = subprocess.run(
+            [str(hermes_bin), "plugins", "install", identifier, "--force", "--yes-deps", "--enable"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            console.print(f"[bold green]✓ Successfully installed {identifier} via Hermes CLI[/bold green]")
+            installed = True
         else:
-            shutil.rmtree(target_plugin_dir)
+            console.print(f"[yellow]Hermes CLI install returned code {res.returncode}. Falling back to git clone/pull...[/yellow]")
 
-    shutil.copytree(repo_plugin_src, target_plugin_dir)
-    console.print(f"[bold green]✓ Installed agy-delegation plugin into {target_plugin_dir}[/bold green]")
+    if not installed:
+        hermes_plugins_dir.mkdir(parents=True, exist_ok=True)
+        if (target_plugin_dir / ".git").exists():
+            console.print(f"[dim]Updating {target_plugin_dir} from GitHub...[/dim]")
+            res = subprocess.run(["git", "-C", str(target_plugin_dir), "pull"], capture_output=True, text=True)
+            if res.returncode != 0:
+                console.print(f"[bold red]Error updating repo: {res.stderr}[/bold red]")
+                return
+        else:
+            if target_plugin_dir.exists():
+                if target_plugin_dir.is_symlink():
+                    target_plugin_dir.unlink()
+                else:
+                    shutil.rmtree(target_plugin_dir)
+            console.print(f"[dim]Cloning {repo_url} into {target_plugin_dir}...[/dim]")
+            res = subprocess.run(["git", "clone", repo_url, str(target_plugin_dir)], capture_output=True, text=True)
+            if res.returncode != 0:
+                console.print(f"[bold red]Error cloning repo: {res.stderr}[/bold red]")
+                return
+
+        console.print(f"[bold green]✓ Installed agy-delegation plugin into {target_plugin_dir}[/bold green]")
 
     res = subprocess.run(["systemctl", "--user", "is-active", "hermes-gateway.service"], capture_output=True, text=True)
     if res.stdout.strip() == "active":

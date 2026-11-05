@@ -1,6 +1,0 @@
-name: agy-delegation
-version: 0.2.0
-description: Routes Hermes subagent delegation directly to Google Antigravity CLI with multi-account pool and live tmux grid.
-author: Mayank Goyal
-entry_point: __init__.py
-enabled: true

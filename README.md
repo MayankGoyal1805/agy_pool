@@ -13,7 +13,7 @@
 - **Dynamic Multi-Pool Quota Monitor**: Discovers and monitors all active Google quota buckets (Gemini, Claude & GPT, Argon, etc.) dynamically with zero hardcoded model lists. Responsive card layout prevents terminal line wrapping.
 - **Live Tmux Multi-Pane Grid**: Dynamically splits and auto-tiles panes in `tmux attach -t subagents` with top border status titles and real-time streaming logs.
 - **Instance & Account Switcher**: Easily switch your primary interactive CLI (`agy`) between accounts in the pool with a single command.
-- **Hermes Delegation Plugin**: Bundled plugin routes Hermes subagents to Antigravity with one-line install (`agy-pool install-hermes-plugin`).
+- **Hermes Delegation Plugin**: Routes Hermes subagents to Antigravity CLI. Install directly with `hermes plugins install MayankGoyal1805/antigravity_delegate_hermes` or via `agy-pool install-hermes-plugin`.
 
 ---
 
@@ -103,8 +103,11 @@ tmux attach -t subagents
 ```
 
 ### 7. Install / Setup Hermes Delegation Plugin
+Pull and install the standalone plugin directly from GitHub into Hermes:
 ```bash
 agy-pool install-hermes-plugin
+# or directly via Hermes CLI:
+hermes plugins install MayankGoyal1805/antigravity_delegate_hermes
 ```
 
 ---

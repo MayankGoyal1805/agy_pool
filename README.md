@@ -9,9 +9,22 @@ Manually switch the Google account behind an [agy](https://antigravity.google) (
 ## Install
 
 ```bash
-uv tool install --force ~/repos/agy_pool   # or: uv tool install git+https://github.com/MayankGoyal1805/agy_pool.git
+uv tool install --force ~/repos/agy_pool   # from a local checkout
 agy-pool instance launcher                 # writes ~/.local/bin/agy-flash
 ```
+
+### On another machine
+
+Needs [uv](https://docs.astral.sh/uv/) and the `agy` binary (found via `AGY_BIN` or `~/.local/bin/agy`).
+
+```bash
+uv tool install git+https://github.com/MayankGoyal1805/agy_pool.git            # install
+uv tool install --force git+https://github.com/MayankGoyal1805/agy_pool.git   # upgrade
+agy-pool instance launcher                                                     # writes ~/.local/bin/agy-flash
+```
+
+Accounts, instances and API keys are per machine and are not copied: run `agy-pool login <label>` and
+`agy-pool instance create ... --api-key --base-url ...` again there.
 
 ## Concepts
 

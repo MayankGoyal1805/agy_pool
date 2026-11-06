@@ -4,13 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agy-pool"
-version = "0.2.0"
-description = "Antigravity Multi-Account Pool & Live Tmux Split Grid Manager"
+version = "0.3.0"
+description = "Manage Google accounts behind agy (Antigravity CLI) instances"
 readme = "README.md"
-authors = [
-    { name = "Mayank Goyal" }
-]
-requires-python = ">=3.9"
+authors = [{ name = "Mayank Goyal" }]
+requires-python = ">=3.10"
 dependencies = [
     "rich>=13.0.0",
     "typer>=0.9.0",
@@ -18,3 +16,9 @@ dependencies = [
 
 [project.scripts]
 agy-pool = "agy_pool.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

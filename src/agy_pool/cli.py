@@ -1,658 +1,395 @@
-"""Antigravity Account Pool & Instance Manager CLI powered by Typer and Rich."""
+"""agy-pool: manage Google accounts behind agy (Antigravity CLI) instances."""
 
 from __future__ import annotations
 
 import datetime
 import os
-import shutil
 import subprocess
-import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import typer
 from rich import box
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
-from .manager import (
-    ACCOUNTS_DIR,
-    AGY_BIN,
-    AccountPoolManager,
-    create_instance,
-    ensure_dirs,
-    get_instance_dir,
-    get_instance_rel_dir,
-    get_instance_remote_status,
-    get_next_available_slot,
-    import_primary_cli_account,
-    list_accounts,
-    list_instances,
-    load_state,
-    remove_instance,
-    resolve_slot_id,
-    save_state,
-    start_instance_remote,
-    stop_instance_remote,
-    switch_instance_account,
-)
-from .quota import fetch_all_usage
-from .tmux import TMUX_SESSION_NAME
+from . import launchers, procs, tokens
+from .paths import TOKEN_FILE, find_agy_binary, get_paths
+from .store import AUTH_ACCOUNT, AUTH_API_KEY, DEFAULT_INSTANCE, Instance, Store, StoreError, validate_label
+from .switching import execute_switch, live_status, plan_switch
+from .usage import fetch_many
 
-console = Console(
-    width=int(os.environ["COLUMNS"]) if "COLUMNS" in os.environ else None,
-    height=int(os.environ.get("LINES", 50)) if "COLUMNS" in os.environ else None,
-)
+console = Console()
+err = Console(stderr=True)
+
 app = typer.Typer(
     name="agy-pool",
-    help="Antigravity Multi-Account Pool & Instance Manager",
+    help="Manage Google accounts behind agy (Antigravity CLI) instances.",
     add_completion=False,
-    no_args_is_help=False,
+    no_args_is_help=True,
 )
-
-instance_app = typer.Typer(
-    name="instance",
-    help="Manage separated Antigravity profile instances on this machine",
-    add_completion=False,
-)
+instance_app = typer.Typer(help="Manage instances (launchers + auth mode).", no_args_is_help=True)
 app.add_typer(instance_app, name="instance")
 
+InstanceOpt = typer.Option(DEFAULT_INSTANCE, "--instance", "-i", help="Instance to act on")
 
-def get_timezone(tz_name: str = "IST") -> datetime.tzinfo:
-    """Resolve timezone by name, supporting IST, UTC, and LOCAL."""
-    upper = tz_name.strip().upper()
-    if upper == "IST":
-        return ZoneInfo("Asia/Kolkata")
-    if upper == "UTC":
-        return datetime.timezone.utc
-    if upper == "LOCAL":
-        return datetime.datetime.now().astimezone().tzinfo or datetime.timezone.utc
+
+def _store() -> Store:
+    return Store(get_paths())
+
+
+def _fail(msg: str) -> None:
+    err.print(f"[bold red]✗[/] {msg}")
+    raise typer.Exit(1)
+
+
+def _ago(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "?"
+    s = int(seconds)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{s // n}{unit}"
+    return f"{s}s"
+
+
+def _mtime(path: Path) -> str:
     try:
-        return ZoneInfo(tz_name)
-    except Exception:
-        return ZoneInfo("Asia/Kolkata")
+        return datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    except OSError:
+        return "-"
 
 
-def format_reset_time(iso_str: Optional[str], tz_name: str = "IST") -> str:
-    """Format full reset timestamp and relative countdown in requested timezone."""
-    if not iso_str:
-        return ""
-    try:
-        clean = iso_str.replace(" UTC", "+00:00").replace("Z", "+00:00")
-        if "T" not in clean and " " in clean:
-            clean = clean.replace(" ", "T")
-        dt_utc = datetime.datetime.fromisoformat(clean)
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        secs = int((dt_utc - now_utc).total_seconds())
-
-        if secs <= 0:
-            rel = "resets now"
-        else:
-            days, rem = divmod(secs, 86400)
-            hours, rem = divmod(rem, 3600)
-            mins, _ = divmod(rem, 60)
-            if days > 0:
-                rel = f"in {days}d {hours}h"
-            elif hours > 0:
-                rel = f"in {hours}h {mins}m"
-            else:
-                rel = f"in {mins}m"
-
-        target_tz = get_timezone(tz_name)
-        target_dt = dt_utc.astimezone(target_tz)
-        tz_label = tz_name.upper()
-
-        if secs > 86400:
-            date_str = target_dt.strftime(f"%b %d, %H:%M {tz_label}")
-        else:
-            date_str = target_dt.strftime(f"%H:%M {tz_label}")
-
-        return f"{date_str} ({rel})"
-    except Exception:
-        return f"({iso_str[:16]})"
-
-
-def format_bar_str(pct: Optional[int], width: int = 4) -> str:
-    if pct is None:
-        return "[dim]--[/dim]"
-    filled = max(0, min(width, int(round((pct / 100.0) * width))))
-    bar = "█" * filled + "░" * (width - filled)
-    color = "green" if pct > 40 else ("yellow" if pct > 15 else "red")
-    return f"[{color}][{bar}] {pct:>3}%[/{color}]"
-
-
-def color_pct_str(pct: Optional[int]) -> str:
-    if pct is None:
-        return "[dim]--[/dim]"
-    color = "green" if pct > 40 else ("yellow" if pct > 15 else "red")
-    return f"[{color}]{pct:>3}%[/{color}]"
-
-
-# =====================================================================
-# Main Commands
-# =====================================================================
-
-@app.command(name="usage")
-def cmd_usage(
-    as_cards: bool = typer.Option(False, "--cards", "-c", help="Show vertical card view"),
-    wide: bool = typer.Option(False, "--wide", "-w", help="Force full 8-column wide table"),
-    tz: str = typer.Option(
-        os.environ.get("AGY_TIMEZONE", "IST"),
-        "--tz",
-        "--timezone",
-        help="Timezone for reset timestamps (default: IST)",
-    ),
-):
-    """View real-time Google quota remaining across all accounts & pools in IST."""
-    with console.status("[bold cyan]Querying Google quota for all accounts in parallel...[/bold cyan]"):
-        results = fetch_all_usage()
-
-    state = load_state()
-    exhausted_map = state.get("exhausted", {})
-    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
-
-    if as_cards:
-        # Pane-resilient Structured Grid Cards
-        console.rule(f"[bold cyan]Antigravity Multi-Account Live Quota Monitor ({tz.upper()})[/bold cyan]")
-        for item in results:
-            acc = item["acc"]
-            slot = acc["id"]
-            email = acc["email"]
-            pools = item.get("pools", {})
-
-            exp_ts = exhausted_map.get(slot, 0)
-            if exp_ts > now_ts:
-                status_text = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
-                border_color = "yellow"
-            elif not acc.get("authenticated"):
-                status_text = "[bold red]UNAUTHENTICATED[/bold red]"
-                border_color = "red"
-            elif item.get("error"):
-                status_text = f"[bold red]ERROR: {item['error']}[/bold red]"
-                border_color = "red"
-            else:
-                status_text = "[bold green]HEALTHY[/bold green]"
-                border_color = "cyan"
-
-            grid = Table.grid(padding=(0, 2), expand=True)
-            grid.add_column("Pool", style="bold yellow", width=18)
-            grid.add_column("Remaining", style="white")
-            grid.add_column("Reset Time (IST)", style="dim white", justify="right")
-
-            gem_grp = pools.get("Gemini Models", {})
-            cld_grp = pools.get("Claude and GPT models", {})
-            argon_grp = pools.get("Gemini 4 Argon", {})
-
-            # 1. Gemini 5-Hr
-            g5 = gem_grp.get("5-hr", {})
-            g5_bar = format_bar_str(g5.get("pct"))
-            g5_rst = format_reset_time(g5.get("reset"), tz) or "--"
-            grid.add_row("Gemini 5-Hr", g5_bar, g5_rst)
-
-            # 2. Gemini Weekly
-            gw = gem_grp.get("weekly", {})
-            gw_bar = format_bar_str(gw.get("pct"))
-            gw_rst = format_reset_time(gw.get("reset"), tz) or "--"
-            grid.add_row("Gemini Weekly", gw_bar, gw_rst)
-
-            # 3. Claude 5-Hr
-            c5 = cld_grp.get("5-hr", {})
-            c5_bar = format_bar_str(c5.get("pct"))
-            grid.add_row("Claude 5-Hr", c5_bar, "--")
-
-            # 4. Claude Weekly
-            cw = cld_grp.get("weekly", {})
-            cw_bar = format_bar_str(cw.get("pct"))
-            grid.add_row("Claude Weekly", cw_bar, "--")
-
-            # 5. Argon Weekly (if available)
-            if argon_grp:
-                ar = argon_grp.get("weekly", {})
-                ar_bar = format_bar_str(ar.get("pct"))
-                ar_rst = format_reset_time(ar.get("reset"), tz) or "--"
-                grid.add_row("Gemini 4 Argon", ar_bar, ar_rst)
-
-            panel = Panel(
-                grid,
-                title=f"[bold cyan]Slot {slot}[/bold cyan] · [bold white]{email}[/bold white]",
-                subtitle=status_text,
-                box=box.ROUNDED,
-                border_style=border_color,
-            )
-            console.print(panel)
-        console.rule()
-        return
-
-    # Full 8-Column Table View
-    table = Table(
-        title="Antigravity Multi-Account Live Quota Monitor",
-        box=box.SQUARE,
-        border_style="cyan",
-        header_style="bold cyan",
-    )
-    table.add_column("Slot", justify="center", style="bold cyan")
-    table.add_column("Email", style="bold white", no_wrap=True)
-    table.add_column("Gemini 5-Hr", justify="center", no_wrap=True)
-    table.add_column("Gemini Wk", justify="center", no_wrap=True)
-    table.add_column("Claude 5-Hr", justify="center", no_wrap=True)
-    table.add_column("Claude Wk", justify="center", no_wrap=True)
-    table.add_column("Argon Wk", justify="center", no_wrap=True)
-    table.add_column("Status", justify="center", no_wrap=True)
-
-    for item in results:
-        acc = item["acc"]
-        slot = acc["id"]
-        email = acc["email"]
-        pools = item.get("pools", {})
-
-        # Status
-        exp_ts = exhausted_map.get(slot, 0)
-        if exp_ts > now_ts:
-            status_str = f"[bold yellow]COOLDOWN ({int((exp_ts - now_ts) / 60)}m)[/bold yellow]"
-        elif not acc.get("authenticated"):
-            status_str = "[bold red]UNAUTH[/bold red]"
-        elif item.get("error"):
-            status_str = "[bold red]ERROR[/bold red]"
-        else:
-            status_str = "[bold green]HEALTHY[/bold green]"
-
-        gem_5hr = format_bar_str(pools.get("Gemini Models", {}).get("5-hr", {}).get("pct"))
-        gem_5hr_rst = format_reset_time(pools.get("Gemini Models", {}).get("5-hr", {}).get("reset"), tz)
-        gem_5hr_cell = f"{gem_5hr}\n{gem_5hr_rst}" if gem_5hr_rst else gem_5hr
-
-        gem_wk = format_bar_str(pools.get("Gemini Models", {}).get("weekly", {}).get("pct"))
-        gem_wk_rst = format_reset_time(pools.get("Gemini Models", {}).get("weekly", {}).get("reset"), tz)
-        gem_wk_cell = f"{gem_wk}\n{gem_wk_rst}" if gem_wk_rst else gem_wk
-
-        cld_grp = pools.get("Claude and GPT models", {})
-        cld_5hr = format_bar_str(cld_grp.get("5-hr", {}).get("pct"))
-        cld_wk = format_bar_str(cld_grp.get("weekly", {}).get("pct"))
-
-        argon_grp = pools.get("Gemini 4 Argon", {})
-        argon_pct = argon_grp.get("weekly", {}).get("pct")
-        if argon_pct is not None:
-            argon_wk = format_bar_str(argon_pct)
-            argon_wk_rst = format_reset_time(argon_grp.get("weekly", {}).get("reset"), tz)
-            argon_cell = f"{argon_wk}\n{argon_wk_rst}" if argon_wk_rst else argon_wk
-        else:
-            argon_cell = "[dim]--[/dim]"
-
-        table.add_row(slot, email, gem_5hr_cell, gem_wk_cell, cld_5hr, cld_wk, argon_cell, status_str)
-
-    console.print(table)
-
-
-@app.command(name="status")
-def cmd_status():
-    """List all accounts in the pool and identify active CLI accounts."""
-    ensure_dirs()
-    accounts = list_accounts(include_symlinks=False)
-    instances = list_instances()
-    primary = next((inst for inst in instances if inst["name"] == "primary"), None)
-    state = load_state()
-    rr_idx = state.get("rr_index", 0)
-
-    table = Table(
-        title=f"Antigravity Account Pool (Total: {len(accounts)} | Next Round-Robin: #{rr_idx})",
-        box=box.ROUNDED,
-        header_style="bold cyan",
-    )
-    table.add_column("Slot", justify="center", style="bold cyan", width=6)
-    table.add_column("Status", justify="center", width=10)
-    table.add_column("Email", style="bold white")
-    table.add_column("CLI Active", justify="center", width=12)
-
-    for acc in accounts:
-        auth_str = "[bold green]YES[/bold green]" if acc["authenticated"] else "[bold red]NO[/bold red]"
-        is_active = "[bold green]● ACTIVE[/bold green]" if primary and primary.get("matching_slot") == acc["id"] else ""
-        table.add_row(acc["id"], auth_str, acc["email"], is_active)
-
-    console.print(table)
-    if primary:
-        console.print(f"  [dim]Primary Interactive CLI (`agy`):[/dim] [bold white]{primary['email']}[/bold white] (Slot {primary.get('matching_slot') or 'Unmanaged'})\n")
-
-
-@app.command(name="login")
-def cmd_login(
-    slot: Optional[str] = typer.Argument(None, help="Slot number (defaults to next available integer)"),
-    force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication"),
-):
-    """Authenticate or add an account slot via browser OAuth."""
-    slot_id = resolve_slot_id(slot)
-    acc_path = ACCOUNTS_DIR / slot_id
-    acc_path.mkdir(parents=True, exist_ok=True)
-    rel_dir = f"account_pool/accounts/{slot_id}"
-
-    token_file = acc_path / "antigravity-oauth-token"
-    if token_file.exists() and not force:
-        console.print(f"[yellow]Slot '{slot_id}' is already authenticated! Use --force to re-login.[/yellow]")
-        return
-
-    console.print(f"\nLaunching Antigravity OAuth login for [bold cyan]Slot {slot_id}[/bold cyan]...")
-    cmd = [AGY_BIN, f"--app_data_dir={rel_dir}", "login"]
-    try:
-        subprocess.run(cmd, check=True)
-        console.print(f"[bold green]✓ Successfully authenticated Slot {slot_id}![/bold green]\n")
-    except subprocess.CalledProcessError as e:
-        console.print(f"[bold red]✗ Authentication failed (code {e.returncode})[/bold red]\n")
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Login cancelled.[/yellow]\n")
-
-
-@app.command(name="rm")
-def cmd_remove(
-    slot: str = typer.Argument(..., help="Slot number to delete (e.g. 3)"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
-):
-    """Remove an account slot from the pool."""
-    slot_id = resolve_slot_id(slot)
-    acc_path = ACCOUNTS_DIR / slot_id
-    alias_path = ACCOUNTS_DIR / f"acc{slot_id}"
-
-    if not acc_path.exists() and not alias_path.exists():
-        console.print(f"[bold red]Slot '{slot_id}' does not exist.[/bold red]")
-        return
-
-    confirm = yes or typer.confirm(f"Are you sure you want to delete Slot {slot_id}?")
-    if confirm:
-        if acc_path.exists():
-            if acc_path.is_symlink():
-                acc_path.unlink()
-            elif acc_path.is_dir():
-                shutil.rmtree(acc_path)
-        if alias_path.exists():
-            if alias_path.is_symlink():
-                alias_path.unlink()
-            elif alias_path.is_dir():
-                shutil.rmtree(alias_path)
-
-        state = load_state()
-        exhausted = state.get("exhausted", {})
-        if slot_id in exhausted:
-            del exhausted[slot_id]
-            state["exhausted"] = exhausted
-            save_state(state)
-
-        console.print(f"[bold green]✓ Removed Slot {slot_id}. Pool dynamically adjusted.[/bold green]")
-
-
-@app.command(name="switch")
-def cmd_switch(
-    slot: str = typer.Argument(..., help="Slot number to activate in primary CLI (e.g. 2)"),
-):
-    """Switch your primary interactive CLI (`agy`) to use a slot's credentials."""
-    ok, msg = switch_instance_account("primary", slot)
-    if ok:
-        console.print(f"[bold green]✓ {msg}[/bold green]")
-        console.print("[dim]You can now run `agy` in your terminal with this account.[/dim]\n")
-    else:
-        console.print(f"[bold red]✗ {msg}[/bold red]\n")
-
-
-@app.command(name="current")
-def cmd_current():
-    """Show which account is active in the primary interactive CLI."""
-    instances = list_instances()
-    primary = next((i for i in instances if i["name"] == "primary"), None)
-    if primary:
-        console.print(f"\n[bold cyan]Active Antigravity CLI Account:[/bold cyan] [bold white]{primary['email']}[/bold white]")
-        console.print(f"  Directory: [dim]{primary['path']}[/dim]")
-        slot_str = f"Slot {primary['matching_slot']}" if primary.get("matching_slot") else "None (Unmanaged)"
-        console.print(f"  Pool Slot: [bold yellow]{slot_str}[/bold yellow]\n")
-
-
-@app.command(name="run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
-def cmd_run(
-    ctx: typer.Context,
-    instance: str = typer.Argument("primary", help="Instance to run (e.g. primary, subagents)"),
-):
-    """Launch the interactive Antigravity CLI for a specific instance."""
-    rel_dir = get_instance_rel_dir(instance)
-    args = ctx.args or []
-    console.print(f"[dim]Launching Antigravity CLI for instance '{instance}' (--app_data_dir={rel_dir})...[/dim]\n")
-    cmd = [AGY_BIN, f"--app_data_dir={rel_dir}"] + args
-    os.execvp(AGY_BIN, cmd)
-
-
-@app.command(name="test")
-def cmd_test():
-    """Ping all authenticated accounts with a lightweight 1-word query."""
-    accounts = [a for a in list_accounts() if a["authenticated"]]
+# ---------------------------------------------------------------- accounts
+@app.command("list")
+def cmd_list() -> None:
+    """List stored accounts and which instance uses each."""
+    store = _store()
+    accounts = store.accounts()
     if not accounts:
-        console.print("[yellow]No authenticated accounts found.[/yellow]")
+        console.print("No accounts yet. Add one with [bold]agy-pool login <label>[/] or [bold]agy-pool import[/].")
         return
+    live = {i.name: live_status(store, i) for i in store.instances() if i.auth == AUTH_ACCOUNT}
+    t = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan")
+    t.add_column("Label", style="bold")
+    t.add_column("Email")
+    t.add_column("Active on")
+    t.add_column("Token saved", style="dim")
+    for a in accounts:
+        on = [n for n, s in live.items() if s.matched and s.matched.label == a.label]
+        t.add_row(a.label, a.email or "[red]no token[/]", ", ".join(on) or "", _mtime(a.token))
+    console.print(t)
 
-    console.print(f"\nPinging {len(accounts)} accounts with lightweight query (gemini-3.8-flash)...")
-    for acc in accounts:
-        cmd = [
-            AGY_BIN,
-            f"--app_data_dir={acc['rel_dir']}",
-            "--model", "gemini-3.8-flash",
-            "--output-format", "json",
-            "--dangerously-skip-permissions",
-        ]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout, stderr = proc.communicate(input="say ok in 1 word", timeout=20)
-        if proc.returncode == 0:
-            console.print(f"  [bold green]✓ Slot {acc['id']:<4}[/bold green] ({acc['email']}): [green]HEALTHY[/green]")
+
+@app.command("current")
+def cmd_current(instance: str = InstanceOpt) -> None:
+    """Show which account an instance is running as, and its agy processes."""
+    store = _store()
+    try:
+        inst = store.get_instance(instance)
+    except StoreError as e:
+        _fail(str(e))
+    console.print(f"Instance [bold cyan]{inst.name}[/]  dir: {store.instance_dir(inst)}")
+    if inst.auth == AUTH_API_KEY:
+        key = store.api_key_file(inst)
+        console.print(f"  auth: API key ({'present' if key.is_file() else '[red]missing[/]'}: {key})")
+    else:
+        s = live_status(store, inst)
+        label = s.matched.label if s.matched else "[yellow]not in store[/] (run `agy-pool import <label> --current`)"
+        console.print(f"  account: [bold]{s.email or '[red]logged out[/]'}[/]  →  {label}")
+        if s.drift:
+            console.print(
+                f"  [bold yellow]⚠ drift:[/] last switched to [bold]{s.recorded}[/], but the live token is "
+                f"{s.email or 'missing'}. Something rewrote it (an agy process that was running during the switch?)."
+            )
+    marked, unmarked = procs.scan(inst.name, store.instance_dir(inst))
+    for p in marked:
+        console.print(f"  [green]●[/] pid {p.pid}  {p.kind}  (up {_ago(p.started_ago)})")
+    for p in unmarked:
+        console.print(f"  [yellow]●[/] pid {p.pid}  {p.kind}, not started via agy-{inst.name} (up {_ago(p.started_ago)})")
+    if not marked and not unmarked:
+        console.print("  [dim]no agy processes running[/]")
+
+
+@app.command("login")
+def cmd_login(
+    label: str = typer.Argument(..., help="Short name for the account, e.g. main, alt1"),
+    force: bool = typer.Option(False, "--force", "-f", help="Re-login an existing account"),
+) -> None:
+    """Add an account by signing in through the browser."""
+    store = _store()
+    try:
+        acc = store.account(label)
+    except StoreError as e:
+        _fail(str(e))
+    if acc.has_token and not force:
+        _fail(f"{acc.label!r} already exists ({acc.email}); use --force to sign in again")
+    acc.dir.mkdir(parents=True, exist_ok=True)
+    if acc.has_token:
+        tokens.backup(acc.token, store.paths.backups, f"relogin-{acc.label}-{acc.email}")
+    cmd = [find_agy_binary(), f"--app_data_dir={store.paths.app_dir_arg(acc.dir)}", "login"]
+    try:
+        rc = subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        rc = 130
+    if rc != 0 or not acc.email:
+        _fail(f"login did not complete (exit {rc})")
+    dup = [a for a in store.accounts() if a.label != acc.label and a.email == acc.email]
+    if dup:
+        console.print(f"[yellow]⚠ {acc.email} is also stored as {dup[0].label!r}[/]")
+    console.print(f"[green]✓[/] {acc.label} → {acc.email}")
+
+
+@app.command("import")
+def cmd_import(
+    label: str = typer.Argument(..., help="Label for the imported account"),
+    from_dir: Optional[Path] = typer.Option(None, "--from", help="agy data dir (or token file) to import from"),
+    current: bool = typer.Option(False, "--current", help="Import the token the instance is using now"),
+    instance: str = InstanceOpt,
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing account"),
+) -> None:
+    """Import an existing token into the store (copy; the source is left untouched)."""
+    store = _store()
+    if bool(from_dir) == current:
+        _fail("pass exactly one of --from DIR or --current")
+    try:
+        if current:
+            inst = store.get_instance(instance)
+            src = store.instance_token(inst)
         else:
-            err = (stderr or stdout).strip()[:80]
-            console.print(f"  [bold red]✗ Slot {acc['id']:<4}[/bold red] ({acc['email']}): [red]FAILED ({err})[/red]")
-    console.print()
+            src = from_dir.expanduser()
+            src = src / TOKEN_FILE if src.is_dir() else src
+        with store.locked():
+            acc = store.import_token(label, src, overwrite=force)
+            if current:
+                inst.account = acc.label
+                store.save_instance(inst)
+    except StoreError as e:
+        _fail(str(e))
+    console.print(f"[green]✓[/] imported {acc.label} → {acc.email}")
 
 
-@app.command(name="view")
-def cmd_view():
-    """Attach to the live subagents tmux grid."""
-    if not shutil.which("tmux"):
-        console.print("[bold red]Error: tmux is not installed.[/bold red]")
-        return
-    res = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION_NAME], capture_output=True)
-    if res.returncode != 0:
-        console.print(f"[yellow]No active '{TMUX_SESSION_NAME}' tmux session yet. Run subagents to spawn one.[/yellow]")
-        return
-    console.print(f"[dim]Attaching to tmux session '{TMUX_SESSION_NAME}' (detach anytime with Ctrl+b d)...[/dim]")
-    os.execvp("tmux", ["tmux", "attach", "-t", TMUX_SESSION_NAME])
+@app.command("rm")
+def cmd_rm(
+    label: str = typer.Argument(...),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Remove a stored account (its token is kept in backups)."""
+    store = _store()
+    try:
+        acc = store.get_account(label)
+        if not yes and not typer.confirm(f"Remove {acc.label} ({acc.email})?"):
+            raise typer.Exit(0)
+        with store.locked():
+            store.remove_account(label)
+    except StoreError as e:
+        _fail(str(e))
+    console.print(f"[green]✓[/] removed {acc.label}")
 
 
-@app.command(name="install-hermes-plugin")
-def cmd_install_plugin():
-    """Install or update the Hermes agy-delegation plugin from GitHub."""
-    repo_url = "https://github.com/MayankGoyal1805/antigravity_delegate_hermes.git"
-    identifier = "MayankGoyal1805/antigravity_delegate_hermes"
-    hermes_bin = shutil.which("hermes") or (Path.home() / ".local" / "bin" / "hermes")
-    hermes_plugins_dir = Path.home() / ".hermes" / "plugins"
-    target_plugin_dir = hermes_plugins_dir / "agy-delegation"
-
-    installed = False
-    if hermes_bin and Path(hermes_bin).exists():
-        console.print(f"[dim]Installing plugin via Hermes CLI (`hermes plugins install {identifier}`)...[/dim]")
-        res = subprocess.run(
-            [str(hermes_bin), "plugins", "install", identifier, "--force", "--yes-deps", "--enable"],
-            capture_output=True,
-            text=True,
-        )
-        if res.returncode == 0:
-            console.print(f"[bold green]✓ Successfully installed {identifier} via Hermes CLI[/bold green]")
-            installed = True
-        else:
-            console.print(f"[yellow]Hermes CLI install returned code {res.returncode}. Falling back to git clone/pull...[/yellow]")
-
-    if not installed:
-        hermes_plugins_dir.mkdir(parents=True, exist_ok=True)
-        if (target_plugin_dir / ".git").exists():
-            console.print(f"[dim]Updating {target_plugin_dir} from GitHub...[/dim]")
-            res = subprocess.run(["git", "-C", str(target_plugin_dir), "pull"], capture_output=True, text=True)
-            if res.returncode != 0:
-                console.print(f"[bold red]Error updating repo: {res.stderr}[/bold red]")
-                return
-        else:
-            if target_plugin_dir.exists():
-                if target_plugin_dir.is_symlink():
-                    target_plugin_dir.unlink()
-                else:
-                    shutil.rmtree(target_plugin_dir)
-            console.print(f"[dim]Cloning {repo_url} into {target_plugin_dir}...[/dim]")
-            res = subprocess.run(["git", "clone", repo_url, str(target_plugin_dir)], capture_output=True, text=True)
-            if res.returncode != 0:
-                console.print(f"[bold red]Error cloning repo: {res.stderr}[/bold red]")
-                return
-
-        console.print(f"[bold green]✓ Installed agy-delegation plugin into {target_plugin_dir}[/bold green]")
-
-    res = subprocess.run(["systemctl", "--user", "is-active", "hermes-gateway.service"], capture_output=True, text=True)
-    if res.stdout.strip() == "active":
-        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway.service"])
-        console.print("[bold green]✓ Restarted hermes-gateway.service[/bold green]")
+@app.command("rename")
+def cmd_rename(old: str = typer.Argument(...), new: str = typer.Argument(...)) -> None:
+    """Rename a stored account."""
+    store = _store()
+    try:
+        with store.locked():
+            acc = store.rename_account(old, new)
+    except StoreError as e:
+        _fail(str(e))
+    console.print(f"[green]✓[/] {old} → {acc.label}")
 
 
-# =====================================================================
-# Instance Sub-commands
-# =====================================================================
+@app.command("switch")
+def cmd_switch(
+    label: str = typer.Argument(..., help="Account to switch to"),
+    instance: str = InstanceOpt,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask before stopping processes"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would happen"),
+) -> None:
+    """Switch an instance to another account.
 
-@instance_app.command(name="list")
-def cmd_instance_list():
-    """List all Antigravity profile instances, their paths, launcher commands, and remote daemons."""
-    instances = list_instances()
-    table = Table(
-        title="Antigravity Profile Instances on this Machine",
-        box=box.SQUARE,
-        border_style="cyan",
-        header_style="bold cyan",
+    Stops the instance's agy processes (only ones started via its launcher), saves the
+    current token back to its account, then installs the new token atomically.
+    """
+    store = _store()
+    try:
+        plan = plan_switch(store, instance, label)
+    except StoreError as e:
+        _fail(str(e))
+    cur = plan.live
+    cur_label = cur.matched.label if cur.matched else "unknown"
+    console.print(
+        f"[bold cyan]{plan.instance.name}[/]: {cur.email or 'logged out'} ({cur_label})  →  "
+        f"[bold]{plan.target.email}[/] ({plan.target.label})"
     )
-    table.add_column("Instance", style="bold cyan")
-    table.add_column("CLI Command", style="bold magenta")
-    table.add_column("Active Account", style="bold white")
-    table.add_column("Pool Slot", justify="center")
-    table.add_column("Remote Control Device", justify="center")
-    table.add_column("Data Mode", justify="center")
-    table.add_column("Storage Path (AppData)", style="dim")
+    if cur.matched and cur.matched.label == plan.target.label and not cur.drift:
+        console.print("[green]Already on that account.[/]")
+        return
+    if plan.to_stop:
+        console.print("Will stop:")
+        for p in plan.to_stop:
+            console.print(f"  pid {p.pid}  {p.kind}  (up {_ago(p.started_ago)})")
+    if plan.unmarked:
+        console.print("[yellow]Not started via the launcher, so left running (they may write the old token back):[/]")
+        for p in plan.unmarked:
+            console.print(f"  pid {p.pid}  {p.kind}  {p.cmdline[:80]}")
+    if dry_run:
+        return
+    if plan.to_stop and not yes and not typer.confirm("Stop these and switch?"):
+        raise typer.Exit(0)
+    try:
+        with store.locked():
+            res = execute_switch(store, plan)
+    except StoreError as e:
+        _fail(str(e))
+    if res.written_back:
+        console.print(f"  saved refreshed token back to {res.written_back}")
+    if res.orphan_backup:
+        console.print(f"  [yellow]previous token was not in the store; saved to {res.orphan_backup}[/]")
+    if res.killed:
+        console.print(f"  force-killed {res.killed}")
+    console.print(f"[green]✓[/] {plan.instance.name} now uses {plan.target.label} ({plan.target.email})")
+    if any(p.kind == "remote-control daemon" for p in plan.to_stop):
+        console.print(f"  remote control was stopped; start it again with: agy-{plan.instance.name} remote-control start")
 
-    for inst in instances:
-        slot_str = f"Slot {inst['matching_slot']}" if inst.get("matching_slot") else "[dim]--[/dim]"
-        data_mode = "[cyan]Primary[/cyan]" if inst.get("is_default") else ("[green]Shared[/green]" if inst.get("shared_data") else "[cyan]Isolated[/cyan]")
 
-        remote_info = get_instance_remote_status(inst["name"])
-        if remote_info["active"]:
-            rc_status = f"[bold green]● Active[/bold green] [dim]({remote_info['hostname']})[/dim]"
+@app.command("usage")
+def cmd_usage(
+    label: Optional[str] = typer.Argument(None, help="Account (default: all)"),
+    tz: str = typer.Option(os.environ.get("AGY_POOL_TZ", "Asia/Kolkata"), "--tz", help="Timezone for reset times"),
+) -> None:
+    """Show remaining quota (one /usage call per account, only when you run this)."""
+    store = _store()
+    try:
+        accounts = [store.get_account(label)] if label else store.accounts()
+        zone = ZoneInfo(tz)
+    except StoreError as e:
+        _fail(str(e))
+    except Exception:
+        _fail(f"unknown timezone {tz!r}")
+    if not accounts:
+        _fail("no accounts")
+    active = {s.matched.label for i in store.instances() if i.auth == AUTH_ACCOUNT
+              for s in [live_status(store, i)] if s.matched}
+    with console.status(f"Querying quota for {len(accounts)} account(s)…"):
+        results = fetch_many(store.paths, accounts)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for r in results:
+        mark = " [green](active)[/]" if r.account.label in active else ""
+        t = Table(title=f"[bold]{r.account.label}[/] · {r.account.email}{mark}", title_justify="left",
+                  box=box.SIMPLE, header_style="dim", show_edge=False)
+        t.add_column("Group")
+        t.add_column("Limit")
+        t.add_column("Left", justify="right")
+        t.add_column("Resets")
+        if r.error:
+            console.print(f"[bold]{r.account.label}[/] · {r.account.email}{mark}: [red]{r.error}[/]\n")
+            continue
+        for lim in r.limits:
+            color = "green" if (lim.pct or 0) > 40 else "yellow" if (lim.pct or 0) > 15 else "red"
+            reset = ""
+            if lim.reset:
+                secs = max(0, int((lim.reset - now).total_seconds()))
+                reset = f"{lim.reset.astimezone(zone):%a %H:%M} (in {_ago(secs)})"
+            t.add_row(lim.group, lim.name, f"[{color}]{lim.pct}%[/]", reset)
+        console.print(t)
+        console.print()
+
+
+# --------------------------------------------------------------- instances
+@instance_app.command("list")
+def cmd_instance_list() -> None:
+    """List instances, their launchers and auth."""
+    store = _store()
+    t = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan")
+    for col in ("Name", "Launcher", "App dir", "Auth"):
+        t.add_column(col)
+    for inst in store.instances():
+        lp = launchers.launcher_path(store.paths, inst)
+        if inst.auth == AUTH_API_KEY:
+            auth = "API key" + (f" @ {inst.base_url}" if inst.base_url else "")
         else:
-            rc_status = "[dim]Inactive[/dim]"
-
-        table.add_row(
-            inst["name"],
-            inst["cli_cmd"],
-            inst["email"],
-            slot_str,
-            rc_status,
-            data_mode,
-            inst["path"],
-        )
-
-    console.print(table)
+            auth = live_status(store, inst).email or "logged out"
+        t.add_row(inst.name, lp.name if lp.exists() else f"[dim]{lp.name} (not written)[/]",
+                  str(store.instance_dir(inst)), auth)
+    console.print(t)
 
 
-@instance_app.command(name="create")
+@instance_app.command("create")
 def cmd_instance_create(
-    name: str = typer.Argument(..., help="New instance name (e.g. subagents, coding)"),
-    slot: Optional[str] = typer.Option(None, "--slot", "-s", help="Slot number to assign (e.g. 2)"),
-    path: Optional[Path] = typer.Option(None, "--path", "-p", help="Custom directory path (optional)"),
-    shared_tools: bool = typer.Option(True, "--tools/--isolated-tools", help="Share MCP config and custom skills"),
-    remote: bool = typer.Option(False, "--remote", "-r", help="Automatically launch background Google Remote Control daemon"),
-    remote_name: Optional[str] = typer.Option(None, "--remote-name", help="Custom label shown on https://antigravity.google.com"),
-):
-    """Create a new Antigravity instance profile with dedicated launcher."""
-    ok, msg = create_instance(name, slot_id=slot, custom_path=path, shared_data=shared_tools)
-    if ok:
-        console.print(f"[bold green]✓ {msg}[/bold green]")
-        console.print(f"[dim]Run directly with `agy-{name}` or `agy-pool run {name}`.[/dim]\n")
-
-        if remote:
-            rok, rmsg = start_instance_remote(name, hostname=remote_name)
-            if rok:
-                console.print(f"[bold green]✓ {rmsg}[/bold green]\n")
-            else:
-                console.print(f"[bold red]✗ {rmsg}[/bold red]\n")
-    else:
-        console.print(f"[bold red]✗ {msg}[/bold red]\n")
-
-
-@instance_app.command(name="switch")
-def cmd_instance_switch(
-    instance: str = typer.Argument(..., help="Instance name (e.g. primary, subagents)"),
-    slot: str = typer.Argument(..., help="Slot number to assign (e.g. 2)"),
-):
-    """Switch any instance's active account to a pool slot and reload remote daemon."""
-    ok, msg = switch_instance_account(instance, slot)
-    if ok:
-        console.print(f"[bold green]✓ {msg}[/bold green]")
-    else:
-        console.print(f"[bold red]✗ {msg}[/bold red]")
+    name: str = typer.Argument(..., help="Instance name, e.g. argon"),
+    app_dir: str = typer.Option("antigravity-cli", "--app-dir", help="agy data dir, must be under ~/.gemini (e.g. antigravity-cli)"),
+    api_key: bool = typer.Option(False, "--api-key", help="Authenticate with a Gemini API key instead of an account"),
+    api_key_file: Optional[Path] = typer.Option(None, "--api-key-file", help="Read the API key from this file"),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="Gemini API endpoint (GOOGLE_GEMINI_BASE_URL) for --api-key"),
+) -> None:
+    """Create an instance and its launcher (agy-<name>)."""
+    store = _store()
+    try:
+        name = validate_label(name, "instance name")
+        if any(i.name == name for i in store.instances()):
+            _fail(f"instance {name!r} already exists")
+        use_key = api_key or api_key_file is not None
+        if base_url and not use_key:
+            _fail("--base-url only applies to --api-key instances")
+        app_dir = store.paths.app_dir_arg(store.paths.resolve_app_dir(app_dir))
+        if Path(app_dir).is_absolute():
+            _fail(f"app dir must be under {store.paths.gemini_root} (agy rejects absolute --app_data_dir)")
+        inst = Instance(name, app_dir, AUTH_API_KEY if use_key else AUTH_ACCOUNT,
+                        base_url=base_url.rstrip("/") if base_url else None)
+        if use_key:
+            key = (api_key_file.read_text() if api_key_file else typer.prompt("Gemini API key", hide_input=True)).strip()
+            if not key:
+                _fail("empty API key")
+            tokens.atomic_write(store.api_key_file(inst), key.encode())
+            store.seed_cli_settings(inst)
+        store.save_instance(inst)
+        path = launchers.write(store, inst)
+    except (StoreError, FileExistsError, OSError) as e:
+        _fail(str(e))
+    console.print(f"[green]✓[/] instance {name} → {path}")
 
 
-@instance_app.command(name="remote")
-def cmd_instance_remote(
-    instance: str = typer.Argument(..., help="Instance name (e.g. primary, subagents, coding)"),
-    action: str = typer.Argument("status", help="Action: status, start, stop, restart"),
-    name: Optional[str] = typer.Option(None, "--name", "-n", help="Machine label to show on https://antigravity.google.com"),
-):
-    """Manage background Google Remote Control daemons and machine names for instances."""
-    action = action.lower()
-    if action == "status":
-        info = get_instance_remote_status(instance)
-        color = "green" if info["active"] else "yellow"
-        state_label = "ACTIVE" if info["active"] else "INACTIVE"
-        console.print(f"\n[bold cyan]Instance '{instance}' Remote Control Status:[/bold cyan]")
-        console.print(f"  Service:  [bold white]{info['service']}[/bold white]")
-        console.print(f"  Status:   [{color}]{state_label}[/{color}]")
-        console.print(f"  Device:   [bold yellow]{info['hostname']}[/bold yellow] (registered on https://antigravity.google.com)\n")
-    elif action in ("start", "restart"):
-        ok, msg = start_instance_remote(instance, hostname=name)
-        if ok:
-            console.print(f"[bold green]✓ {msg}[/bold green]\n")
-        else:
-            console.print(f"[bold red]✗ {msg}[/bold red]\n")
-    elif action == "stop":
-        ok, msg = stop_instance_remote(instance)
-        if ok:
-            console.print(f"[bold green]✓ {msg}[/bold green]\n")
-        else:
-            console.print(f"[bold red]✗ {msg}[/bold red]\n")
-    else:
-        console.print(f"[bold red]Unknown action '{action}'. Use status, start, stop, or restart.[/bold red]")
+@instance_app.command("launcher")
+def cmd_instance_launcher(
+    name: Optional[str] = typer.Argument(None, help="Instance (default: all)"),
+    force: bool = typer.Option(False, "--force", help="Overwrite a file not created by agy-pool"),
+) -> None:
+    """(Re)write launcher scripts."""
+    store = _store()
+    try:
+        insts = [store.get_instance(name)] if name else store.instances()
+        for inst in insts:
+            console.print(f"[green]✓[/] {launchers.write(store, inst, force=force)}")
+    except (StoreError, FileExistsError) as e:
+        _fail(str(e))
 
 
-@instance_app.command(name="rm")
+@instance_app.command("rm")
 def cmd_instance_rm(
-    name: str = typer.Argument(..., help="Instance name to delete"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
-):
-    """Delete a custom Antigravity instance directory and its launcher."""
-    confirm = yes or typer.confirm(f"Are you sure you want to delete instance '{name}'?")
-    if confirm:
-        ok, msg = remove_instance(name)
-        if ok:
-            console.print(f"[bold green]✓ {msg}[/bold green]")
-        else:
-            console.print(f"[bold red]✗ {msg}[/bold red]")
+    name: str = typer.Argument(...),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Remove an instance's registration, launcher and API key. The app dir and chats are not touched."""
+    store = _store()
+    try:
+        inst = store.get_instance(name)
+    except StoreError as e:
+        _fail(str(e))
+    if inst.name == DEFAULT_INSTANCE:
+        _fail(f"{DEFAULT_INSTANCE!r} is the default instance and can't be removed")
+    if not yes and not typer.confirm(f"Remove instance {inst.name}? (app dir is left alone)"):
+        raise typer.Exit(0)
+    launchers.remove(store, inst)
+    key = store.api_key_file(inst)
+    if key.exists():
+        key.unlink()
+    store.delete_instance(inst.name)
+    console.print(f"[green]✓[/] removed instance {inst.name}")
 
 
-@instance_app.command(name="run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
-def cmd_instance_run(
-    ctx: typer.Context,
-    name: str = typer.Argument(..., help="Instance name to launch"),
-):
-    """Launch the interactive Antigravity CLI for a specific instance."""
-    rel_dir = get_instance_rel_dir(name)
-    args = ctx.args or []
-    console.print(f"[dim]Launching Antigravity CLI for instance '{name}' (--app_data_dir={rel_dir})...[/dim]\n")
-    cmd = [AGY_BIN, f"--app_data_dir={rel_dir}"] + args
-    os.execvp(AGY_BIN, cmd)
-
-
-def main():
+def main() -> None:
     app()
 
 

@@ -1,137 +1,89 @@
 # agy-pool
 
-> **Antigravity Multi-Account Pool & Live Tmux Split Grid Manager**
+Manually switch the Google account behind an [agy](https://antigravity.google) (Antigravity CLI) instance, without moving your chats.
 
-`agy-pool` manages a dynamic pool of Google Pro accounts for Google Antigravity (`agy`) CLI subagents and manages local Antigravity CLI instances.
+- **One chat directory.** Instances point at `~/.gemini/antigravity-cli` (agy's default), so the CLI, T3 Code and the VS Code extension all see the same chats.
+- **Accounts are swappable tokens.** Each stored account is a tiny agy data dir holding its OAuth token. Switching copies the token into the instance.
+- **No background polling.** Quota is only checked when you run `agy-pool usage`.
 
----
-
-## Key Features
-
-- **Round-Robin Allocation**: Distributes parallel subagents across multiple accounts, preventing Token-Per-Minute (TPM) and Requests-Per-Minute (RPM) rate limits.
-- **Automatic Quota Failover**: Detects `429` / `RESOURCE_EXHAUSTED` and automatically rotates to the next healthy account without failing subagent tasks.
-- **Dynamic Multi-Pool Quota Monitor**: Discovers and monitors all active Google quota buckets (Gemini, Claude & GPT, Argon, etc.) dynamically with zero hardcoded model lists. Responsive card layout prevents terminal line wrapping.
-- **Live Tmux Multi-Pane Grid**: Dynamically splits and auto-tiles panes in `tmux attach -t subagents` with top border status titles and real-time streaming logs.
-- **Instance & Account Switcher**: Easily switch your primary interactive CLI (`agy`) between accounts in the pool with a single command.
-- **Hermes Delegation Plugin**: Routes Hermes subagents to Antigravity CLI. Install directly with `hermes plugins install MayankGoyal1805/antigravity_delegate_hermes` or via `agy-pool install-hermes-plugin`.
-
----
-
-## Installation via `uv`
-
-Install `agy-pool` globally using `uv`:
+## Install
 
 ```bash
-uv tool install git+https://github.com/MayankGoyal1805/agy_pool.git
+uv tool install --force ~/repos/agy_pool   # or: uv tool install git+https://github.com/MayankGoyal1805/agy_pool.git
+agy-pool instance launcher                 # writes ~/.local/bin/agy-flash
 ```
 
-Or from a local checkout:
+## Concepts
+
+| Thing | What it is |
+|---|---|
+| **Account** | `~/.gemini/agy-pool/accounts/<label>/antigravity-oauth-token` |
+| **Instance** | A name + an app dir + an auth mode. `flash` (default) uses a stored account; others can use a Gemini API key. |
+| **Launcher** | `~/.local/bin/agy-<instance>`: runs `agy --app_data_dir=<dir>` and sets `AGY_POOL_INSTANCE=<instance>` so `switch` knows which processes belong to it. |
+
+Point anything that should follow the switchable account (T3 Code ACP provider, your shell) at `agy-flash`:
 
 ```bash
-cd ~/repos/agy_pool
-uv tool install . --force
+alias agy=agy-flash          # optional: make plain `agy` the flash instance
+# T3 Code: ACP provider, command /home/ubuntu/.local/bin/agy-flash, args: acp
 ```
 
----
+## Commands
 
-## CLI Usage
-
-### 1. View Live Quota Across All Pools
 ```bash
-agy-pool usage
-```
-Displays multi-account quota monitor in IST:
-```text
-======================================================================================================================
-  Antigravity Multi-Account Live Quota & Usage Monitor (IST)
-======================================================================================================================
-  SLOT  EMAIL                      GEMINI 5HR   RESET (IST)           GEMINI WK    CLAUDE 5HR   CLAUDE WK    ARGON WK   STATUS
-----------------------------------------------------------------------------------------------------------------------
-  1     dev1@example.com           [████░] 86%  10:35 PM (in 3h 12m)  [██░░░] 50%  [█████]100%  [█████]100%      --     HEALTHY
-  2     dev2@example.com           [█████]100%  09:03 PM (in 1h 40m)  [███░░] 53%  [█████]100%  [█████]100%      --     HEALTHY
-  3     dev3@example.com           [█████]100%  09:55 PM (in 2h 32m)  [█████]100%  [█████]100%  [█████]100%      --     HEALTHY
-  4     dev4@example.com           [█████]100%  10:06 PM (in 2h 42m)  [██░░░] 36%  [█████]100%  [█████]100%      --     HEALTHY
-  5     dev5@example.com           [█████]100%  10:26 PM (in 3h 3m)   [█████]100%  [█████]100%  [█████]100%  [████░] 77% HEALTHY
-======================================================================================================================
-  Note: '--' indicates the model group is not available for that account slot.
-======================================================================================================================
+agy-pool login main               # add an account via browser OAuth
+agy-pool import alt --from DIR    # import a token from an existing agy data dir
+agy-pool import main --current    # adopt the token the instance is using now
+agy-pool list                     # accounts and where they're active
+agy-pool current                  # live account of an instance + its agy processes
+agy-pool switch alt               # switch flash to `alt`
+agy-pool switch alt --dry-run     # show what would be stopped
+agy-pool usage [label]            # quota, on demand
+agy-pool rename alt work
+agy-pool rm work
+
+agy-pool instance create argon --api-key --base-url http://HOST:PORT   # API-key instance sharing the same chats
+agy-pool instance list
+agy-pool instance launcher [name]          # (re)write launchers
+agy-pool instance rm argon
 ```
 
-### 2. View Account Pool & CLI Status
+## How `switch` works
+
+1. Finds agy processes started via the instance's launcher (env marker). Processes not started through it, such as the VS Code extension or a plain `agy`, are never stopped; unmarked ones using the dir are listed as a warning.
+2. Asks, then stops them (SIGTERM, SIGKILL after 8s). A running agy keeps its token in memory and refreshes it about hourly, writing it back to the file, which would undo the switch.
+3. Copies the live token back to its stored account (it's the freshest copy). An unknown token is saved to `backups/`.
+4. Atomically installs the new token (temp file + fsync + rename, mode 0600) and records it.
+
+T3 Code starts a fresh `agy-flash acp` on your next message, which loads the new account. If remote control was running, restart it with `agy-flash remote-control start`.
+
+`agy-pool current` warns about **drift**: the live token no longer matches the last switch, meaning something rewrote it.
+
+## API-key instances
+
+agy only uses `GEMINI_API_KEY` when `modelProvider: "gemini"` is set. Without it, agy ignores the key and signs in with the OAuth token in the dir. Putting that in the shared `settings.json` would flip the account instance too, so the launcher keeps it per instance:
+
+- `agy-argon acp …` → `agy --app_data_dir=<dir> acp --cli_dir_name=argon …`. Settings, logs and cache live in `<dir>/argon/`, seeded from the shared `settings.json` at create time. Chats stay shared.
+- any other command → `agy --app_data_dir=<dir> --settings '{"modelProvider":"gemini"}' …`. This is a session-only override; the top-level CLI has no `--cli_dir_name`.
+
+The launcher exports `GEMINI_API_KEY` (from `secrets/<name>.key`), `GOOGLE_GEMINI_BASE_URL` (if `--base-url` was given), and unsets `GOOGLE_API_KEY`. In this mode agy never reads or refreshes the OAuth token, and remote control isn't available.
+
+Note: agy rejects an absolute `--app_data_dir`, so app dirs must live under `~/.gemini`.
+
+## Files
+
+```
+~/.gemini/agy-pool/
+  state.json            instances + last switched account
+  accounts/<label>/     one agy data dir per account
+  backups/              every token we overwrite
+  secrets/<inst>.key    API keys (0600)
+```
+
+Env overrides: `AGY_BIN`, `AGY_POOL_HOME`, `AGY_POOL_GEMINI_ROOT`, `AGY_POOL_BIN_DIR`, `AGY_POOL_TZ`.
+
+## Development
+
 ```bash
-agy-pool status
-```
-
-### 3. Account & Instance Switching
-- Check which account is active in your primary `agy` CLI:
-  ```bash
-  agy-pool current
-  ```
-- Switch your primary `agy` CLI to use Slot 2's credentials:
-  ```bash
-  agy-pool switch 2
-  ```
-- Import the currently active CLI account into the pool:
-  ```bash
-  agy-pool import-current
-  ```
-- List all Antigravity instances and profiles on the machine:
-  ```bash
-  agy-pool instances
-  ```
-
-### 4. Add / Login Accounts
-- Auto-assign next number:
-  ```bash
-  agy-pool login
-  ```
-- Login or re-authenticate a specific slot:
-  ```bash
-  agy-pool login 6
-  ```
-
-### 5. Remove Accounts
-```bash
-agy-pool rm 3
-```
-
-### 6. Attach to Live Subagents Tmux Grid
-```bash
-agy-pool view
-# or
-tmux attach -t subagents
-```
-
-### 7. Install / Setup Hermes Delegation Plugin
-Pull and install the standalone plugin directly from GitHub into Hermes:
-```bash
-agy-pool install-hermes-plugin
-# or directly via Hermes CLI:
-hermes plugins install MayankGoyal1805/antigravity_delegate_hermes
-```
-
----
-
-## Python API (for Hermes / Custom Orchestrators)
-
-```python
-from agy_pool.manager import AccountPoolManager
-from agy_pool.tmux import TmuxSubagentGrid
-
-# 1. Lease next account via thread-safe round-robin
-account = AccountPoolManager.get_next_healthy_account()
-# Returns: {"id": "1", "rel_dir": "account_pool/accounts/1", "email": "..."}
-
-# 2. Allocate pane in tmux subagent grid
-pane_id, log_file = TmuxSubagentGrid.allocate_pane(
-    subagent_id="sa-1",
-    role="leaf",
-    account_id=account["id"],
-    email=account["email"],
-    cwd="/path/to/repo",
-    goal="Analyze repository files",
-)
-
-# 3. Mark account exhausted if rate limited (triggers automatic failover)
-AccountPoolManager.mark_account_exhausted(account["id"], cooldown_hours=3.0)
+uv run --group dev pytest
 ```

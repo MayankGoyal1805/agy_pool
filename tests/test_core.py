@@ -222,3 +222,13 @@ def test_accounts_addressable_by_position(env, tmp_path):
         env.get_account("3")
     with pytest.raises(StoreError, match="reserved"):
         env.account("7")
+
+
+def test_remaining_countdown_is_precise():
+    from agy_pool.cli import _remaining
+    assert _remaining(6 * 86400 + 3 * 3600 + 59) == "6d 3h"
+    assert _remaining(4 * 3600 + 12 * 60 + 5) == "4h 12m"
+    assert _remaining(3600) == "1h 0m"
+    assert _remaining(35 * 60 + 9) == "35m"
+    assert _remaining(40) == "40s"
+    assert _remaining(-5) == "0s"

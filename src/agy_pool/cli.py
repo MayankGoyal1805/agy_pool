@@ -54,6 +54,21 @@ def _ago(seconds: Optional[float]) -> str:
     return f"{s}s"
 
 
+def _remaining(seconds: int) -> str:
+    """Countdown with the two largest non-zero-width units: 6d 3h, 4h 12m, 35m, 40s."""
+    s = max(0, int(seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m"
+    return f"{sec}s"
+
+
 def _mtime(path: Path) -> str:
     try:
         return datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
@@ -292,7 +307,7 @@ def cmd_usage(
             reset = ""
             if lim.reset:
                 secs = max(0, int((lim.reset - now).total_seconds()))
-                reset = f"{lim.reset.astimezone(zone):%a %H:%M} (in {_ago(secs)})"
+                reset = f"{lim.reset.astimezone(zone):%a %H:%M} (in {_remaining(secs)})"
             t.add_row(lim.group, lim.name, f"[{color}]{lim.pct}%[/]", reset)
         console.print(t)
         console.print()

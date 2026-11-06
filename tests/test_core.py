@@ -203,3 +203,22 @@ def test_cli_flow(env, tmp_path, live_token):
     assert env.get_instance("argon").base_url == "http://h:2048"
     assert "http://h:2048" in r.invoke(app, ["instance", "list"]).output
     assert r.invoke(app, ["switch", "a", "-i", "argon"]).exit_code == 1
+
+
+def test_accounts_addressable_by_position(env, tmp_path):
+    import pytest
+    from agy_pool.store import StoreError
+    for lbl in ("acc2", "acc10", "acc1"):
+        d = env.account(lbl).dir
+        d.mkdir(parents=True)
+    assert [a.label for a in env.accounts()] == ["acc1", "acc2", "acc10"]  # natural order
+    assert env.get_account("2").label == "acc2"
+    assert env.get_account("3").label == "acc10"
+    assert env.number(env.get_account("acc10")) == 3
+    # removing from the middle renumbers
+    env.remove_account("acc2")
+    assert env.get_account("2").label == "acc10"
+    with pytest.raises(StoreError, match="no account #3"):
+        env.get_account("3")
+    with pytest.raises(StoreError, match="reserved"):
+        env.account("7")

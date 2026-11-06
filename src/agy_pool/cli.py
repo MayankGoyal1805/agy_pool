@@ -72,13 +72,14 @@ def cmd_list() -> None:
         return
     live = {i.name: live_status(store, i) for i in store.instances() if i.auth == AUTH_ACCOUNT}
     t = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan")
+    t.add_column("#", style="bold cyan", justify="right")
     t.add_column("Label", style="bold")
     t.add_column("Email")
     t.add_column("Active on")
     t.add_column("Token saved", style="dim")
-    for a in accounts:
-        on = [n for n, s in live.items() if s.matched and s.matched.label == a.label]
-        t.add_row(a.label, a.email or "[red]no token[/]", ", ".join(on) or "", _mtime(a.token))
+    for n, a in enumerate(accounts, 1):
+        on = [i for i, s in live.items() if s.matched and s.matched.label == a.label]
+        t.add_row(str(n), a.label, a.email or "[red]no token[/]", ", ".join(on) or "", _mtime(a.token))
     console.print(t)
 
 
@@ -172,7 +173,7 @@ def cmd_import(
 
 @app.command("rm")
 def cmd_rm(
-    label: str = typer.Argument(...),
+    label: str = typer.Argument(..., help="Account # or label"),
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Remove a stored account (its token is kept in backups)."""
@@ -202,7 +203,7 @@ def cmd_rename(old: str = typer.Argument(...), new: str = typer.Argument(...)) -
 
 @app.command("switch")
 def cmd_switch(
-    label: str = typer.Argument(..., help="Account to switch to"),
+    label: str = typer.Argument(..., help="Account to switch to: its # or label from `agy-pool list`"),
     instance: str = InstanceOpt,
     yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask before stopping processes"),
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would happen"),
@@ -221,7 +222,7 @@ def cmd_switch(
     cur_label = cur.matched.label if cur.matched else "unknown"
     console.print(
         f"[bold cyan]{plan.instance.name}[/]: {cur.email or 'logged out'} ({cur_label})  →  "
-        f"[bold]{plan.target.email}[/] ({plan.target.label})"
+        f"[bold]{plan.target.email}[/] (#{store.number(plan.target)} {plan.target.label})"
     )
     if cur.matched and cur.matched.label == plan.target.label and not cur.drift:
         console.print("[green]Already on that account.[/]")
@@ -256,7 +257,7 @@ def cmd_switch(
 
 @app.command("usage")
 def cmd_usage(
-    label: Optional[str] = typer.Argument(None, help="Account (default: all)"),
+    label: Optional[str] = typer.Argument(None, help="Account # or label (default: all)"),
     tz: str = typer.Option(os.environ.get("AGY_POOL_TZ", "Asia/Kolkata"), "--tz", help="Timezone for reset times"),
 ) -> None:
     """Show remaining quota (one /usage call per account, only when you run this)."""
@@ -277,7 +278,7 @@ def cmd_usage(
     now = datetime.datetime.now(datetime.timezone.utc)
     for r in results:
         mark = " [green](active)[/]" if r.account.label in active else ""
-        t = Table(title=f"[bold]{r.account.label}[/] · {r.account.email}{mark}", title_justify="left",
+        t = Table(title=f"[bold]#{store.number(r.account)} {r.account.label}[/] · {r.account.email}{mark}", title_justify="left",
                   box=box.SIMPLE, header_style="dim", show_edge=False)
         t.add_column("Group")
         t.add_column("Limit")

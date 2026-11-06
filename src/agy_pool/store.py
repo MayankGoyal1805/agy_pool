@@ -35,7 +35,14 @@ def validate_label(label: str, what: str = "label") -> str:
     label = label.strip().lower()
     if not LABEL_RE.match(label):
         raise StoreError(f"invalid {what} {label!r}: use a-z, 0-9, '-', '_' (max 32 chars)")
+    if what == "label" and label.isdigit():
+        raise StoreError(f"invalid {what} {label!r}: a bare number is reserved for the account's position in `agy-pool list`")
     return label
+
+
+def _natural_key(name: str) -> list:
+    """Sort 'acc2' before 'acc10'."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
 
 
 @dataclass
@@ -107,18 +114,33 @@ class Store:
     def account(self, label: str) -> Account:
         return Account(validate_label(label), self.paths.accounts / validate_label(label))
 
-    def get_account(self, label: str) -> Account:
-        acc = self.account(label)
+    def get_account(self, ref: str) -> Account:
+        """Look up an account by label, or by its 1-based position in `agy-pool list`."""
+        ref = ref.strip()
+        if ref.isdigit():
+            accounts = self.accounts()
+            n = int(ref)
+            if not 1 <= n <= len(accounts):
+                raise StoreError(f"no account #{n} (have {len(accounts)}; see `agy-pool list`)")
+            return accounts[n - 1]
+        acc = self.account(ref)
         if not acc.dir.is_dir():
             raise StoreError(f"no account named {acc.label!r} (see `agy-pool list`)")
         return acc
+
+    def number(self, acc: Account) -> Optional[int]:
+        """1-based position of an account in `agy-pool list` (what you can type instead of its label)."""
+        for n, a in enumerate(self.accounts(), 1):
+            if a.label == acc.label:
+                return n
+        return None
 
     def accounts(self) -> list[Account]:
         if not self.paths.accounts.is_dir():
             return []
         return [
             Account(p.name, p)
-            for p in sorted(self.paths.accounts.iterdir())
+            for p in sorted(self.paths.accounts.iterdir(), key=lambda p: _natural_key(p.name))
             if p.is_dir() and LABEL_RE.match(p.name)
         ]
 

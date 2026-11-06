@@ -50,6 +50,7 @@ agy-pool import main --current    # adopt the token the instance is using now
 agy-pool list                     # accounts and where they're active
 agy-pool current                  # live account of an instance + its agy processes
 agy-pool switch alt               # switch flash to `alt`
+agy-pool switch 2                 # or by its # in `agy-pool list` (renumbers if you remove an account)
 agy-pool switch alt --dry-run     # show what would be stopped
 agy-pool usage [label]            # quota, on demand
 agy-pool rename alt work
